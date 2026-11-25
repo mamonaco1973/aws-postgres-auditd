@@ -278,11 +278,49 @@ SSL mode `disable`. The queries are in
 
 ## Findings
 
-FINDINGS_PLACEHOLDER
+Measured on this lab (`m7i.large`, PostgreSQL 18.6, auditd 4.1.2) with a
+synthetic 100,000-record log chain (50,300 events, 25 MB raw, 4.6 MB on disk
+as active + `.1` + six `.gz` files). Median of 5 runs; cold = page cache
+dropped and PostgreSQL restarted first. All event-level contenders returned
+identical results.
+
+| Query | FDW raw (regex in SQL) | FDW `events_v` (ausearch) | `search_events` | Native, btree |
+|---|---|---|---|---|
+| Full count | 4.4 s | 557 ms | – | 2.3 ms |
+| Key + 1-hour window | 3.2 s | 554 ms | 110 ms | 1.1 ms |
+| Group by user, action | 6.7 s | 562 ms | – | 10.5 ms |
+| One event by serial | 3.6 s | 557 ms | – | 0.7 ms |
+| Top-10 files | 5.2 s | 562 ms | – | 7.2 ms |
+| Failed ops, 24 h | 3.6 s | 558 ms | 177 ms | 2.0 ms |
+
+Warm runs shown; cold adds about 100 ms to the FDW and 60–100 ms to native.
+
+- **Every FDW query costs the same**, whatever it asks: about 0.55 s, because
+  each one re-reads and re-parses the whole chain (no pushdown). That cost
+  grows with the logs: a full ausearch pass took 0.5 s at 100K records,
+  4.8 s at 1M and 51 s at 10M.
+- **Filtering inside ausearch** (`search_events`) cut a selective query from
+  554 ms to 110 ms and CPU from 0.98 s to 0.18 s, but it still reads every
+  record.
+- **Parsing raw records with SQL regexes** costs 6–12× more than letting
+  ausearch do it.
+- **Native** answers in milliseconds, but it is a copy: 8.5 MB of table and
+  2.5 MB of btree indexes for 4.6 MB of compressed logs, loaded in 0.9 s.
+- **Freshness:** a new event was visible through `events_v` within
+  0.2–1.2 s; the native table waits for the next 60-second ingest.
+- **Rotation:** writing 10,000 events while rotating every 3 seconds and
+  counting continuously gave no duplicates, no gaps and no lost events;
+  both the FDW and the native table ended at exactly 10,000.
 
 ## When to use which
 
-WHEN_PLACEHOLDER
+| Need | Better choice | Why (measured above) |
+|---|---|---|
+| See an event the moment it happens | FDW | visible in about a second vs up to 60 s |
+| No extra storage, no pipeline to run | FDW | the logs are the table |
+| Occasional ad-hoc questions on recent logs | FDW | half a second per query is fine |
+| Repeated, selective or concurrent queries | Native | milliseconds vs half a second, and FDW cost grows with log size |
+| History beyond log rotation and retention | Native | the FDW sees only the files that still exist |
 
 ## Limits
 

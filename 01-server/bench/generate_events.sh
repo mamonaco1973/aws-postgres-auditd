@@ -45,9 +45,11 @@ done
 for u in alice bob; do
   id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
 done
-install -d -o alice -g alice -m 0755 /data/alice
-install -d -o bob   -g bob   -m 0755 /data/bob
-install -d -o root  -g root  -m 1777 /data/shared
+# Only when missing: install -d re-applies owner and mode every time, and
+# each of those is a data_watch event that would inflate the demo counts.
+[ -d /data/alice ]  || install -d -o alice -g alice -m 0755 /data/alice
+[ -d /data/bob ]    || install -d -o bob   -g bob   -m 0755 /data/bob
+[ -d /data/shared ] || install -d -o root  -g root  -m 1777 /data/shared
 
 # ------------------------------------------------------------------------------
 # as USER CMD...: run CMD as USER with the audit login UID set to USER

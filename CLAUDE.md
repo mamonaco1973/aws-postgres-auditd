@@ -68,7 +68,7 @@ VPC auditd-vpc 10.0.0.0/24 (us-east-2)
 | `01-server/sql/01..05-*.sql` | roles/schemas, raw layer, ausearch layer, `search_events`, native |
 | `01-server/sql/queries.sql` | the README "Try it" walkthrough |
 | `01-server/systemd/` | ingest + rotate services/timers, PostgreSQL cgroup accounting drop-in |
-| `01-server/bench/` | generator, corpus synthesizer, query files, `run_bench.sh`, `rotation_test.sh`, `summarize.py`, `results/SUMMARY.md` |
+| `01-server/bench/` | generator, corpus synthesizer, query files, `run_bench.sh`, `rotation_test.sh`, `summarize.py` |
 | `make_diagram.py` | regenerates `architecture-{light,dark}.svg` |
 
 ## Auth Pattern
@@ -190,8 +190,10 @@ Other things learned:
 
 `run_bench.sh` (all phases, several hours at 10M), launched with
 `systemd-run` as above.
-Results: `01-server/bench/results/*.csv` (gitignored) and `SUMMARY.md`
-(committed). Ingest timer paused during query phases. See README "Findings".
+Results: `01-server/bench/results/*.csv` (gitignored). Only the 100K query
+matrix was run on the deployed lab (2026-11-25); the 1M/10M matrices,
+pgbench and freshness phases were stopped as unnecessary for the demo. The
+rotation test (3 runs) passed on a test instance. See README "Findings".
 
 ## Code Commenting Standards
 

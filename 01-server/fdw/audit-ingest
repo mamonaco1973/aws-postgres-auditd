@@ -37,7 +37,11 @@ work=$(mktemp -d)
 chmod 0755 "$work"
 trap 'rm -rf "$work"' EXIT
 
-t0=$(date +%s%3N)
+# Monotonic start time (ms since boot). Wall-clock arithmetic across bash and
+# PostgreSQL once gave a negative duration, so each side now measures only
+# its own part on its own clock: bash up to the load, PostgreSQL the load.
+mono_ms() { awk '{ printf "%d", $1 * 1000 }' /proc/uptime; }
+t0=$(mono_ms)
 lock_shared "$LIVE_DIR"
 
 if [ -f "$CP" ]; then cp -p "$CP" "$work/cp"; fi
@@ -138,14 +142,15 @@ WITH ins AS (
 INSERT INTO audit_native.ingest_log
   (rows_loaded, rows_skipped_dup, duration_ms, max_event_time, exit_code, note)
 SELECT n.loaded, n.staged - n.loaded,
-       (extract(epoch FROM clock_timestamp()) * 1000)::bigint - :t0,
+       :pre_ms + (extract(epoch FROM clock_timestamp() - now()) * 1000)::bigint,
        (SELECT max(event_time) FROM audit_native.events),
        :rc, NULLIF(:'note', '')
 FROM n;
 COMMIT;
 SQL
 
-runuser -u postgres -- psql -X -q -d "$DB" -v t0="$t0" -v rc="$rc" \
+pre_ms=$(( $(mono_ms) - t0 ))
+runuser -u postgres -- psql -X -q -d "$DB" -v pre_ms="$pre_ms" -v rc="$rc" \
   -v note="$note" -f "$work/load.sql" < "$work/load.csv"
 
 # ------------------------------------------------------------------------------
