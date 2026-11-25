@@ -284,6 +284,11 @@ as active + `.1` + six `.gz` files). Median of 5 runs; cold = page cache
 dropped and PostgreSQL restarted first. All event-level contenders returned
 identical results.
 
+Only this 100K query matrix was run in full. The scaling, freshness and
+rotation figures below come from separate, smaller runs, noted on each;
+the 1M and 10M query matrices and the concurrency (pgbench) phase were not
+run.
+
 | Query | FDW raw (regex in SQL) | FDW `events_v` (ausearch) | `search_events` | Native, btree |
 |---|---|---|---|---|
 | Full count | 4.4 s | 557 ms | – | 2.3 ms |
@@ -297,8 +302,10 @@ Warm runs shown; cold adds about 100 ms to the FDW and 60–100 ms to native.
 
 - **Every FDW query costs the same**, whatever it asks: about 0.55 s, because
   each one re-reads and re-parses the whole chain (no pushdown). That cost
-  grows with the logs: a full ausearch pass took 0.5 s at 100K records,
-  4.8 s at 1M and 51 s at 10M.
+  grows with the logs: a single full ausearch pass over each corpus took
+  0.5 s at 100K records, 4.8 s at 1M and 51 s at 10M. Those are single
+  passes, not the query matrix, but they put every FDW query at 1M around
+  5 s and at 10M around a minute.
 - **Filtering inside ausearch** (`search_events`) cut a selective query from
   554 ms to 110 ms and CPU from 0.98 s to 0.18 s, but it still reads every
   record.
@@ -306,20 +313,31 @@ Warm runs shown; cold adds about 100 ms to the FDW and 60–100 ms to native.
   ausearch do it.
 - **Native** answers in milliseconds, but it is a copy: 8.5 MB of table and
   2.5 MB of btree indexes for 4.6 MB of compressed logs, loaded in 0.9 s.
-- **Freshness:** a new event was visible through `events_v` within
-  0.2–1.2 s; the native table waits for the next 60-second ingest.
+- **Freshness:** in spot checks a new event was visible through `events_v`
+  within 0.2–1.2 s, which is what the design predicts: the next query sees
+  it, and a query takes about 0.55 s. The native table waits for the next
+  60-second ingest. The 20-sample freshness phase was stopped early, so
+  there is no median or p95.
+- **Concurrency: not measured.** By the numbers above, each `events_v`
+  query burns about 1 CPU-second at 100K on a 2-vCPU `m7i.large`, and
+  concurrent queries share nothing (each starts its own `zcat` and
+  `ausearch`), so more than two at once should queue for CPU. That is an
+  expectation, not a result; `run_bench.sh --phases concurrency` measures
+  it.
 - **Rotation:** writing 10,000 events while rotating every 3 seconds and
   counting continuously gave no duplicates, no gaps and no lost events;
-  both the FDW and the native table ended at exactly 10,000.
+  both the FDW and the native table ended at exactly 10,000 (3 runs, on a
+  test instance).
 
 ## When to use which
 
-| Need | Better choice | Why (measured above) |
+| Need | Better choice | Why |
 |---|---|---|
-| See an event the moment it happens | FDW | visible in about a second vs up to 60 s |
+| See an event the moment it happens | FDW | visible on the next query (spot checks: about a second) vs up to 60 s |
 | No extra storage, no pipeline to run | FDW | the logs are the table |
-| Occasional ad-hoc questions on recent logs | FDW | half a second per query is fine |
-| Repeated, selective or concurrent queries | Native | milliseconds vs half a second, and FDW cost grows with log size |
+| Occasional ad-hoc questions on recent logs | FDW | half a second per query is fine at 100K |
+| Repeated or selective queries | Native | milliseconds vs half a second (measured), and FDW cost grows with log size |
+| Many users querying at once | Native (expected) | every FDW query re-parses the whole chain on its own; not measured |
 | History beyond log rotation and retention | Native | the FDW sees only the files that still exist |
 
 ## Limits
