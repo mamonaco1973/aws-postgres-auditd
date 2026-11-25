@@ -1,0 +1,121 @@
+#!/bin/bash
+# ==============================================================================
+# FILE: audit-rotate   (installed as /usr/local/sbin/audit-rotate)
+# ==============================================================================
+# Rotates /var/log/audit into the chain the FDW wrappers read:
+#
+#   audit.log.N.gz ... audit.log.2.gz   compressed history (oldest = highest N)
+#   audit.log.1                         previous file, left uncompressed
+#                                       (delaycompress) so ausearch
+#                                       --input-logs and its checkpoint still
+#                                       find it
+#   audit.log                           active file
+#
+# Steps:
+#   1) Run audit-ingest once, so the native table has consumed audit.log.1
+#      before it is compressed out of ausearch --input-logs' reach.
+#   2) Take the rotation lock EXCLUSIVELY. The FDW wrappers and the ingest
+#      hold it shared while they read, so no reader ever sees a half-shifted
+#      chain (missing, duplicated or misordered files).
+#   3) Shift .N.gz -> .N+1.gz, compress .1 -> .2.gz, prune past $KEEP.
+#   4) SIGUSR1: auditd itself renames audit.log -> audit.log.1 and opens a
+#      new audit.log. Nothing is lost: auditd closes the old file only after
+#      the rename, and the kernel queue holds events in the meantime.
+#
+# Usage: audit-rotate [--no-ingest]
+#
+# Not idempotent by nature (every run rotates), but safe to run repeatedly
+# and concurrently: a second run waits for the lock.
+# ==============================================================================
+
+set -euo pipefail
+
+DIR=/var/log/audit
+LOCK=/run/audit-fdw/rotate.lock
+KEEP="${AUDIT_ROTATE_KEEP:-30}"     # highest compressed generation kept
+GROUP=auditread
+
+# ------------------------------------------------------------------------------
+# 1) Catch the native ingest up first
+# ------------------------------------------------------------------------------
+# Must run before the lock is taken: the ingest takes it shared.
+# ------------------------------------------------------------------------------
+if [ "${1:-}" != "--no-ingest" ] && \
+   systemctl list-unit-files audit-ingest.service >/dev/null 2>&1; then
+  systemctl start audit-ingest.service || \
+    echo "audit-rotate: WARNING audit-ingest failed; rotating anyway" >&2
+fi
+
+# ------------------------------------------------------------------------------
+# 2) Exclusive lock
+# ------------------------------------------------------------------------------
+exec 9<"$LOCK"
+flock -x 9
+cd "$DIR"
+
+# Refuse to run on a chain this script didn't produce: an uncompressed .2 or
+# higher means someone ran "service auditd rotate" by hand, and shifting
+# around it would misorder the history.
+if compgen -G 'audit.log.[2-9]' >/dev/null || \
+   compgen -G 'audit.log.[1-9][0-9]' >/dev/null; then
+  echo "audit-rotate: ERROR uncompressed audit.log.N (N>=2) present;" \
+       "fix the chain by hand" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# 3) Shift compressed history up by one, oldest first so nothing collides
+# ------------------------------------------------------------------------------
+max=$(find . -maxdepth 1 -name 'audit.log.*.gz' -printf '%f\n' |
+      sed -n 's/^audit\.log\.\([0-9]*\)\.gz$/\1/p' | sort -n | tail -1)
+for ((n = ${max:-0}; n >= 2; n--)); do
+  if [ -e "audit.log.$n.gz" ]; then
+    mv -f "audit.log.$n.gz" "audit.log.$((n + 1)).gz"
+  fi
+done
+
+# Compress .1 under a name the FDW and log_files ignore, set the final mode
+# BEFORE it becomes visible (root's umask would otherwise make it 0644),
+# then rename into place and drop the original.
+if [ -e audit.log.1 ]; then
+  umask 077
+  gzip -c audit.log.1 > .audit.log.2.gz.tmp
+  chgrp "$GROUP" .audit.log.2.gz.tmp
+  chmod 0440 .audit.log.2.gz.tmp
+  mv -f .audit.log.2.gz.tmp audit.log.2.gz
+  rm -f audit.log.1
+fi
+
+# Prune past the retention limit.
+find . -maxdepth 1 -name 'audit.log.*.gz' -printf '%f\n' |
+  sed -n 's/^audit\.log\.\([0-9]*\)\.gz$/\1/p' |
+  while read -r n; do
+    if [ "$n" -gt "$KEEP" ]; then rm -f "audit.log.$n.gz"; fi
+  done
+
+# ------------------------------------------------------------------------------
+# 4) Let auditd rename audit.log -> audit.log.1 and open a fresh file
+# ------------------------------------------------------------------------------
+old_inode=$(stat -c %i audit.log)
+auditctl --signal rotate >/dev/null
+
+# Wait until the rename has landed, so the lock is released on a complete
+# chain. auditd does this within milliseconds; 10 s is a generous ceiling.
+for _ in $(seq 1 100); do
+  if [ -e audit.log ] && [ -e audit.log.1 ] &&
+     [ "$(stat -c %i audit.log.1)" = "$old_inode" ]; then
+    break
+  fi
+  sleep 0.1
+done
+if [ "$(stat -c %i audit.log.1 2>/dev/null)" != "$old_inode" ]; then
+  echo "audit-rotate: ERROR auditd did not rotate within 10 s" >&2
+  exit 1
+fi
+
+# auditd sets log_group on the files it creates and renames; this catches any
+# history left from before log_group was changed.
+chgrp "$GROUP" audit.log.* 2>/dev/null || true
+
+echo "audit-rotate: rotated; chain is now:"
+find . -maxdepth 1 -name 'audit.log*' -printf '  %f %s bytes\n' | sort -V

@@ -1,0 +1,21 @@
+#!/bin/bash
+# ==============================================================================
+# FILE: raw-records DIR
+# ==============================================================================
+# Backs audit_fdw.raw_records: every raw audit record from DIR, oldest file
+# first. zcat -f passes plain files through and decompresses .gz, so active,
+# rotated and compressed files all come out as one stream.
+# ==============================================================================
+
+set -euo pipefail
+. /usr/local/lib/audit-fdw/common.sh
+
+dir=$(check_dir "${1:-$LIVE_DIR}")
+lock_shared "$dir"
+
+cd "$dir"
+mapfile -t files < <(list_files "$dir")
+[ "${#files[@]}" -gt 0 ] || exit 0
+
+# exec keeps fd 9 (the shared lock) open until zcat finishes.
+exec zcat -f -- "${files[@]}"

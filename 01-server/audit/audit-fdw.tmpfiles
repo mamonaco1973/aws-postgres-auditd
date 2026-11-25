@@ -1,0 +1,6 @@
+# /etc/tmpfiles.d/audit-fdw.conf
+# Rotation lock shared by audit-rotate (exclusive) and the FDW wrappers and
+# audit-ingest (shared). World-readable on purpose: flock works on a
+# read-only descriptor, so postgres needs read access but never write.
+d /run/audit-fdw 0755 root root -
+f /run/audit-fdw/rotate.lock 0644 root root -

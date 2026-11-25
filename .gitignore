@@ -5,3 +5,8 @@
 *.terraform.*
 *.pem
 password.txt
+__pycache__/
+*.pyc
+01-server/bench/results/*
+!01-server/bench/results/SUMMARY.md
+!01-server/bench/results/.gitkeep

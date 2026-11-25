@@ -3,23 +3,24 @@
 # FILE: validate.sh
 # ==============================================================================
 # PURPOSE:
-#   Resolves and prints the public pgweb endpoint for an EC2 instance
-#   providing a lightweight web UI for PostgreSQL database access.
+#   Waits for the auditd lab server to finish bootstrapping, then prints the
+#   pgweb URL, the connection settings, and the command that fetches the
+#   audit_reader password.
 #
 # WHAT THIS SCRIPT DOES:
-#   1) Looks up a running EC2 instance by its Name tag.
-#   2) Extracts the instance's PublicDnsName.
-#   3) Fails fast if the instance has no public DNS (or is not found).
-#   4) Prints the resulting pgweb URL for quick validation.
+#   1) Looks up the running EC2 instance tagged Name=auditd-server.
+#   2) Waits for it to register with SSM.
+#   3) Polls over SSM Run Command for /root/bootstrap.done, the marker
+#      written as the last step of cloud-init (packages, PostgreSQL schema,
+#      pgweb, seeded demo events), with a timeout.
+#   4) Prints the results.
+#
+# SSM rather than HTTP: pgweb answers on port 80 well before the database
+# schema and demo events are in place, so a 200 from pgweb proves little.
 #
 # PREREQUISITES:
-#   - AWS CLI installed and configured with permissions for ec2:DescribeInstances
-#   - The target EC2 instance exists, is running, and has a public DNS name
-#     (i.e., it is in a public subnet with a public IPv4 / EIP).
-#
-# NOTES:
-#   - This script assumes pgweb is served from the web root ("/").
-#   - If multiple instances share the same Name tag, the first match is used.
+#   - AWS CLI with ec2:DescribeInstances, ssm:SendCommand,
+#     ssm:GetCommandInvocation, ssm:DescribeInstanceInformation
 # ==============================================================================
 
 set -euo pipefail
@@ -27,99 +28,109 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------------------
-# AWS region where the pgweb EC2 instance is running.
 AWS_REGION="us-east-2"
+INSTANCE_NAME="auditd-server"
+SECRET_ID="auditd-postgres-credentials"
+POLL=15
+SSM_TIMEOUT=600
+BOOT_TIMEOUT=1200
 
 # ------------------------------------------------------------------------------
-# RESOLVE PGWEB ENDPOINT
+# FUNCTION: find_instance
 # ------------------------------------------------------------------------------
-# Expected EC2 Name tag value for the pgweb host.
-PGWEB_INSTANCE_NAME="pgweb-deployment"
-
+# Prints "<instance-id> <public-dns>" for the running auditd-server.
 # ------------------------------------------------------------------------------
-# FUNCTION: get_public_dns
-# ------------------------------------------------------------------------------
-# Returns the public DNS name for the first running EC2 instance whose Name tag
-# matches the provided value.
-#
-# Args:
-#   $1: instance_name  (value of the Name tag)
-#
-# Output:
-#   Writes the PublicDnsName to stdout (or "None" if not present).
-get_public_dns() {
-  local instance_name="$1"
-
-  aws ec2 describe-instances \
-    --region "${AWS_REGION}" \
-    --filters \
-      "Name=tag:Name,Values=${instance_name}" \
-      "Name=instance-state-name,Values=running" \
-    --query 'Reservations[0].Instances[0].PublicDnsName' \
+find_instance() {
+  aws ec2 describe-instances --region "$AWS_REGION" \
+    --filters "Name=tag:Name,Values=${INSTANCE_NAME}" \
+              "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].[InstanceId,PublicDnsName]' \
     --output text
 }
 
-# Resolve public DNS name for the pgweb host.
-PGWEB_PUBLIC_DNS=$(get_public_dns "${PGWEB_INSTANCE_NAME}")
+# ------------------------------------------------------------------------------
+# FUNCTION: run_onbox ID COMMAND
+# ------------------------------------------------------------------------------
+# Runs one shell command over SSM and prints its stdout.
+# ------------------------------------------------------------------------------
+run_onbox() {
+  local id="$1" cmd="$2" cid params
+  params=$(jq -nc --arg c "$cmd" '{commands:[$c]}')
+  cid=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$id" \
+    --document-name "AWS-RunShellScript" --parameters "$params" \
+    --query 'Command.CommandId' --output text)
+  aws ssm wait command-executed --region "$AWS_REGION" \
+    --command-id "$cid" --instance-id "$id" >/dev/null 2>&1 || true
+  aws ssm get-command-invocation --region "$AWS_REGION" \
+    --command-id "$cid" --instance-id "$id" \
+    --query 'StandardOutputContent' --output text
+}
 
-# ------------------------------------------------------------------------------
-# VALIDATION
-# ------------------------------------------------------------------------------
-# Fail fast if the instance is missing a public DNS name (not found, stopped,
-# or running without a public interface).
-if [[ -z "${PGWEB_PUBLIC_DNS}" || "${PGWEB_PUBLIC_DNS}" == "None" ]]; then
-  echo "ERROR: ${PGWEB_INSTANCE_NAME} has no public DNS name"
+read -r INSTANCE_ID PUBLIC_DNS < <(find_instance)
+if [[ -z "${INSTANCE_ID:-}" || "$INSTANCE_ID" == "None" ]]; then
+  echo "ERROR: no running instance tagged ${INSTANCE_NAME}"
   exit 1
 fi
 
 # ------------------------------------------------------------------------------
-# DATABASE ENDPOINT RESOLUTION
+# WAIT FOR SSM REGISTRATION
 # ------------------------------------------------------------------------------
-# Resolve database connection endpoints used by pgweb.
-#
-# These endpoints are NOT required for pgweb to start, but are printed for
-# convenience so the operator can easily copy/paste them when connecting
-# pgweb to either backend.
-#
-# Both endpoints are resolved dynamically from AWS to avoid hardcoding
-# DNS names that may change across environments.
+elapsed=0
+while true; do
+  status=$(aws ssm describe-instance-information --region "$AWS_REGION" \
+    --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+    --query 'InstanceInformationList[0].PingStatus' --output text \
+    2>/dev/null || echo None)
+  [ "$status" = "Online" ] && break
+  if [ "$elapsed" -ge "$SSM_TIMEOUT" ]; then
+    echo "ERROR: ${INSTANCE_ID} not online in SSM after ${SSM_TIMEOUT}s"
+    exit 1
+  fi
+  echo "NOTE: waiting for ${INSTANCE_ID} to register with SSM (${elapsed}s)..."
+  sleep "$POLL"
+  elapsed=$((elapsed + POLL))
+done
+
 # ------------------------------------------------------------------------------
-
-# Aurora PostgreSQL cluster identifier (Terraform-managed)
-# This should match the aws_rds_cluster identifier exactly.
-CLUSTER_ID="aurora-postgres-cluster"
-
-# Resolve the Aurora PostgreSQL writer endpoint.
-# pgweb should always connect to the writer endpoint when targeting Aurora.
-AURORA_ENDPOINT=$(aws rds describe-db-clusters \
-  --region "${AWS_REGION}" \
-  --db-cluster-identifier "${CLUSTER_ID}" \
-  --query 'DBClusters[0].Endpoint' \
-  --output text)
-
-# Resolve the standalone RDS PostgreSQL instance endpoint.
-# This is the primary connection address for the RDS-backed deployment.
-RDS_ENDPOINT=$(aws rds describe-db-instances \
-  --region "${AWS_REGION}" \
-  --db-instance-identifier "postgres-rds-instance" \
-  --query "DBInstances[0].Endpoint.Address" \
-  --output text)
+# WAIT FOR THE BOOTSTRAP MARKER
+# ------------------------------------------------------------------------------
+elapsed=0
+while true; do
+  out=$(run_onbox "$INSTANCE_ID" \
+    'test -f /root/bootstrap.done && echo DONE || tail -1 /root/userdata.log 2>/dev/null' \
+    || true)
+  [[ "$out" == DONE* ]] && break
+  if [ "$elapsed" -ge "$BOOT_TIMEOUT" ]; then
+    echo "ERROR: bootstrap not finished after ${BOOT_TIMEOUT}s."
+    echo "       aws ssm start-session --target ${INSTANCE_ID}, then"
+    echo "       sudo tail -50 /root/userdata.log"
+    exit 1
+  fi
+  echo "NOTE: bootstrap running (${elapsed}s): ${out:0:70}"
+  sleep "$POLL"
+  elapsed=$((elapsed + POLL))
+done
 
 # ------------------------------------------------------------------------------
 # DISPLAY RESULTS
 # ------------------------------------------------------------------------------
-
 echo "=========================================================================="
 echo " PROJECT ENDPOINTS"
 echo "=========================================================================="
 echo
 echo " PGWEB Application:"
-echo "   http://${PGWEB_PUBLIC_DNS}"
+echo "   http://${PUBLIC_DNS}"
 echo
-echo " RDS Instance:"
-echo "   ${RDS_ENDPOINT}"
+echo " Connect with:"
+echo "   Host localhost   Port 5432   Database auditdb"
+echo "   User audit_reader   SSL mode disable"
 echo
-echo " Aurora Instance:"
-echo "   ${AURORA_ENDPOINT}"
+echo " Password:"
+echo "   aws secretsmanager get-secret-value --region ${AWS_REGION} \\"
+echo "     --secret-id ${SECRET_ID} --query SecretString --output text \\"
+echo "     | jq -r .audit_reader_password"
+echo
+echo " Shell on the server:"
+echo "   aws ssm start-session --region ${AWS_REGION} --target ${INSTANCE_ID}"
 echo
 echo "=========================================================================="

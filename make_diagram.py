@@ -6,13 +6,12 @@ from inline SVG, so a `prefers-color-scheme` media query inside the document is
 silently dropped. The README pairs them with <picture>, which GitHub honours.
 
 A README diagram is studied, not narrated, so it is COMPLETE rather than
-minimal: the pgweb host, the Aurora writer, reader and the cluster volume
-they share, the RDS primary, its read replica and its Multi-AZ standby, and
-the secret store are all on it.
+minimal: both read paths (the FDW wrappers reading the log chain on every
+query, and the 60-second ingest into the native table), the rotation job that
+reshapes the chain, auditd and the watched directory, and the secret store.
 
-The Multi-AZ standby is drawn DASHED on purpose. It is a real instance you pay
-for, but it has no endpoint and can't be read, and that invisibility is why it
-gets confused with the read replica.
+The native path's edges are drawn DASHED: it is the conventional pipeline the
+FDW is being compared against, and it runs on a timer, not per query.
 
 Run:  python3 make_diagram.py
 """
@@ -29,8 +28,9 @@ GUTTER = 140                               # between columns: room for a label
 MARGIN = 40
 COL = [MARGIN + i * (NW + GUTTER) for i in range(3)]
 ROW = [40 + i * 200 for i in range(5)]
-W = MARGIN * 2 + NW * 3 + GUTTER * 2
-H = ROW[4] + NH + 40
+RIGHT = 70                                 # room for the rotation edge
+W = MARGIN * 2 + NW * 3 + GUTTER * 2 + RIGHT
+H = ROW[3] + NH + 40
 TITLE_PX, SUB_PX, EDGE_PX = 26, 17, 16
 
 THEMES = {
@@ -76,6 +76,19 @@ ICONS = {
                 '<line x1="12" x2="12" y1="17" y2="21"/>'],
     "terminal": ['<polyline points="4 17 10 11 4 5"/>',
                  '<line x1="12" x2="20" y1="19" y2="19"/>'],
+    "clock": ['<circle cx="12" cy="12" r="10"/>',
+              '<polyline points="12 6 12 12 16 14"/>'],
+    "files": ['<path d="M15 2h-4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8"/>',
+              '<path d="M16.706 2.706A2.4 2.4 0 0 0 15 2v5a1 1 0 0 0 1 1h5'
+              'a2.4 2.4 0 0 0-.706-1.706z"/>',
+              '<path d="M5 7a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 1.732-1"/>'],
+    "shield": ['<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 '
+               '4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 '
+               '1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>'],
+    "rotate": ['<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>',
+               '<path d="M3 3v5h5"/>'],
+    "folder": ['<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69'
+               '-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'],
     "users": ['<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>',
               '<circle cx="9" cy="7" r="4"/>',
               '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/>',
@@ -104,67 +117,82 @@ def gutter_y(r):
 # ------------------------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------------------------
-# One band per engine. Aurora on top: the writer and the reader, with the
-# cluster volume under the writer. RDS below: the primary and its read
-# replica, with the Multi-AZ standby under the primary. The single pgweb host
-# sits between the bands on the left and connects to both writers.
+# Everything below the browser and the secret runs on one EC2 instance.
+# Left column: what the user touches (pgweb, the native table). Middle: the
+# PostgreSQL FDW schema and the ingest timer. Right: the wrappers, the log
+# chain and auditd, i.e. the files. Rotation sits top right and reaches the
+# chain down the right-hand margin.
 #
 # id: (x, y, colour key, icon, title, subtitle[, "dashed"])
 NODES.update({
     "client":   (COL[0], ROW[0], "navy", "globe", "Browser",
-                 "from the internet"),
+                 "pgweb as audit_reader"),
     "secrets":  (COL[1], ROW[0], "store", "key", "Secrets Manager",
-                 "aurora-postgres- and postgres-credentials"),
-    "writer":   (COL[1], ROW[1], "blue", "database", "Aurora writer",
-                 "instance-1, Serverless v2, 0-4 ACU"),
-    "reader":   (COL[2], ROW[1], "blue", "database", "Aurora reader",
-                 "instance-2, the failover target"),
-    "pgweb":    (COL[0], ROW[2], "amber", "monitor", "pgweb-deployment",
-                 "Ubuntu 24.04, t3.medium, pgweb"),
-    "volume":   (COL[1], ROW[2], "local", "layers", "Aurora cluster volume",
-                 "one copy of the data, shared"),
-    "primary":  (COL[1], ROW[3], "purple", "database", "RDS primary",
-                 "postgres-rds-instance, db.t4g.micro"),
-    "replica":  (COL[2], ROW[3], "purple", "database", "RDS read replica",
-                 "postgres-rds-replica, own endpoint"),
-    "standby":  (COL[1], ROW[4], "purple", "database", "Multi-AZ standby",
-                 "no endpoint, not readable", "dashed"),
+                 "auditd-postgres-credentials"),
+    "rotate":   (COL[2], ROW[0], "amber", "rotate", "audit-rotate",
+                 "ingest first, gzip .1, SIGUSR1"),
+    "pgweb":    (COL[0], ROW[1], "amber", "monitor", "pgweb (:80)",
+                 "auditd-server, Ubuntu 26.04"),
+    "fdw":      (COL[1], ROW[1], "blue", "database", "audit_fdw schema",
+                 "PostgreSQL 18, file_fdw tables"),
+    "wrappers": (COL[2], ROW[1], "purple", "terminal", "audit-fdw wrappers",
+                 "zcat -f | ausearch, shared lock"),
+    "native":   (COL[0], ROW[2], "blue", "database", "audit_native.events",
+                 "PostgreSQL 18, indexed table"),
+    "ingest":   (COL[1], ROW[2], "local", "clock", "audit-ingest.timer",
+                 "every 60 s, checkpointed"),
+    "chain":    (COL[2], ROW[2], "store", "files", "/var/log/audit",
+                 "audit.log, .1, .2.gz ... .N.gz"),
+    "data":     (COL[1], ROW[3], "navy", "folder", "/data",
+                 "alice and bob at work"),
+    "auditd":   (COL[2], ROW[3], "purple", "shield", "auditd 4.1.2",
+                 "-w /data -p wa -k data_watch"),
 })
 
-cli, sec, wr, rd = _r("client"), _r("secrets"), _r("writer"), _r("reader")
-pg, vol, pri, rep, stb = (_r("pgweb"), _r("volume"), _r("primary"),
-                          _r("replica"), _r("standby"))
-SPLIT = 30                    # the two database lines leaving pgweb
+cli, sec, rot, pg = _r("client"), _r("secrets"), _r("rotate"), _r("pgweb")
+fdw, wr, nat, ing = _r("fdw"), _r("wrappers"), _r("native"), _r("ingest")
+ch, dat, aud = _r("chain"), _r("data"), _r("auditd")
+RX = rot[2] + RIGHT / 2                   # x of the right-margin lane
 
 # id: (path, colour key, label, label_x, label_y, anchor[, "dashed"])
 EDGES = {
-    "e_pw":     (f"M{sec[0]},{sec[5]} H{cli[2] + 5}", "store",
-                 "password", gutter_x(0), sec[5] - 12, "middle"),
     "e_http":   (f"M{cli[4]},{cli[3]} V{pg[1] - 5}", "line",
                  "HTTP :80", cli[4] + 14, gutter_y(0) + 6, "start"),
-    "e_sql_a":  (f"M{pg[2]},{pg[5] - SPLIT} H{gutter_x(0)} V{wr[5]} "
-                 f"H{wr[0] - 5}", "line",
-                 "5432", gutter_x(0), wr[5] - 12, "middle"),
-    "e_sql_r":  (f"M{pg[2]},{pg[5] + SPLIT} H{gutter_x(0)} V{pri[5]} "
-                 f"H{pri[0] - 5}", "line",
-                 "5432", gutter_x(0), pri[5] - 12, "middle"),
-    "e_rw":     (f"M{wr[4]},{wr[3]} V{vol[1] - 5}", "local",
-                 "read / write", wr[4] + 14, gutter_y(1) + 6, "start"),
-    "e_rd":     (f"M{rd[4]},{rd[3]} V{vol[5]} H{vol[2] + 5}", "local",
-                 "read", rd[4] + 14, gutter_y(1) + 6, "start"),
-    "e_async":  (f"M{pri[2]},{pri[5]} H{rep[0] - 5}", "purple",
-                 "async copy", gutter_x(1), pri[5] - 12, "middle"),
-    "e_sync":   (f"M{pri[4]},{pri[3]} V{stb[1] - 5}", "purple",
-                 "sync mirror", pri[4] + 14, gutter_y(3) + 6, "start", "dashed"),
+    "e_pw":     (f"M{sec[4]},{sec[3]} V{fdw[1] - 5}", "store",
+                 "passwords at boot", sec[4] + 14, gutter_y(0) + 6, "start"),
+    "e_sql":    (f"M{pg[2]},{pg[5]} H{fdw[0] - 5}", "line",
+                 "localhost:5432", gutter_x(0), pg[5] - 12, "middle"),
+    "e_sqln":   (f"M{pg[4]},{pg[3]} V{nat[1] - 5}", "line",
+                 "SQL", pg[4] + 14, gutter_y(1) + 6, "start"),
+    "e_prog":   (f"M{fdw[2]},{fdw[5]} H{wr[0] - 5}", "blue",
+                 "program", gutter_x(1), fdw[5] - 12, "middle"),
+    "e_read":   (f"M{wr[4]},{wr[3]} V{ch[1] - 5}", "purple",
+                 "read all, oldest first", wr[4] + 14, gutter_y(1) + 6,
+                 "start"),
+    "e_ckpt":   (f"M{ing[2]},{ing[5]} H{ch[0] - 5}", "local",
+                 "--checkpoint", gutter_x(1), ing[5] - 12, "middle",
+                 "dashed"),
+    "e_copy":   (f"M{ing[0]},{ing[5]} H{nat[2] + 5}", "local",
+                 "COPY", gutter_x(0), ing[5] - 12, "middle",
+                 "dashed"),
+    "e_append": (f"M{aud[4]},{aud[1]} V{ch[3] + 5}", "purple",
+                 "append", aud[4] + 14, gutter_y(2) + 6, "start"),
+    "e_watch":  (f"M{dat[2]},{dat[5]} H{aud[0] - 5}", "navy",
+                 "kernel events", gutter_x(1), dat[5] - 12, "middle"),
+    "e_rot":    (f"M{rot[2]},{rot[5]} H{RX} V{ch[5]} H{ch[2] + 5}", "amber",
+                 "rotate", RX + 4, gutter_y(0) + 6, "start"),
 }
 
-ALT = ("A browser reaches one pgweb host over HTTP, which connects to both "
-       "PostgreSQL engines on port 5432. The Aurora PostgreSQL writer and "
-       "reader both sit on one shared cluster volume, and the reader is the "
-       "failover target. The RDS for PostgreSQL primary copies asynchronously "
-       "to a read replica with its own endpoint and mirrors synchronously to a "
-       "Multi-AZ standby that has no endpoint. The admin passwords are in "
-       "Secrets Manager.")
+ALT = ("A browser reaches pgweb on port 80 and signs in as audit_reader. "
+       "pgweb queries PostgreSQL on localhost. The audit_fdw schema's foreign "
+       "tables run wrapper scripts on every query, which pipe the whole "
+       "/var/log/audit chain, oldest file first, through zcat and ausearch. "
+       "auditd appends kernel events for the watched /data directory to the "
+       "chain. Separately, audit-ingest runs every 60 seconds, reads new "
+       "events with an ausearch checkpoint and copies them into the indexed "
+       "audit_native.events table. audit-rotate runs the ingest, compresses "
+       "the previous file and signals auditd to start a new one. The "
+       "database passwords are in Secrets Manager.")
 
 # ------------------------------------------------------------------------------
 # Rendering

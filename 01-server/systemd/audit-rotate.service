@@ -1,0 +1,11 @@
+# ==============================================================================
+# audit-rotate.service: compress-and-rotate /var/log/audit (see audit-rotate).
+# Also run on demand: sudo audit-rotate
+# ==============================================================================
+[Unit]
+Description=Rotate and compress the audit log chain
+After=auditd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/audit-rotate

@@ -1,0 +1,95 @@
+#!/bin/bash
+# ==============================================================================
+# FILE: events DIR [-ts MM/DD/YY HH:MM:SS] [-te MM/DD/YY HH:MM:SS] [-k KEY]
+# ==============================================================================
+# Backs audit_fdw.events and search_events(): pipes the whole chain into
+# ausearch's stdin and emits one CSV row per correlated event.
+#
+# Why stdin and not --input-logs: --input-logs reads only uncompressed files,
+# and stdin lets one path cover active, rotated and .gz files alike, in the
+# order list_files gives. (On 26.04 ausearch without either reads the system
+# logs when stdin is /dev/null, as it is under PostgreSQL, so the explicit
+# pipe matters for the benchmark corpora too.)
+#
+# Exit status: ausearch exits 1 both for "<no matches>" and for real errors.
+# file_fdw fails the query on any non-zero exit, so this wrapper turns
+# "exactly <no matches>" into success with no rows and keeps everything else
+# a failure.
+# ==============================================================================
+
+set -euo pipefail
+. /usr/local/lib/audit-fdw/common.sh
+
+dir=$(check_dir "${1:-$LIVE_DIR}")
+shift || true
+
+# ------------------------------------------------------------------------------
+# Validate the filters strictly: they come from SQL (search_events) and go
+# onto ausearch's command line.
+# ------------------------------------------------------------------------------
+filters=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -ts|-te)
+      [ $# -ge 3 ] || die "$1 needs a date and a time"
+      [[ "$2" =~ ^[0-9]{2}/[0-9]{2}/[0-9]{2}$ ]] || die "bad date: $2"
+      [[ "$3" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || die "bad time: $3"
+      filters+=("$1" "$2" "$3"); shift 3 ;;
+    -k)
+      [ $# -ge 2 ] || die "-k needs a key"
+      [[ "$2" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "bad key: $2"
+      filters+=(-k "$2"); shift 2 ;;
+    *)
+      die "unknown argument: $1" ;;
+  esac
+done
+
+lock_shared "$dir"
+cd "$dir"
+mapfile -t files < <(list_files "$dir")
+
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+
+# ------------------------------------------------------------------------------
+# The pipeline. pipefail is suspended so every stage's status can be read
+# from PIPESTATUS and judged separately.
+# ------------------------------------------------------------------------------
+set +e +o pipefail
+if [ "${#files[@]}" -gt 0 ]; then
+  zcat -f -- "${files[@]}"
+else
+  true
+fi |
+  LC_ALL=C TZ=UTC ausearch "${AUSEARCH_OPTS[@]}" "${filters[@]}" 2>"$err" |
+  "$AUDIT_FDW_LIB/utf8-clean" |
+  awk -f "$AUDIT_FDW_LIB/csv-repair.awk"
+st=("${PIPESTATUS[@]}")
+set -e -o pipefail
+
+zcat_rc=${st[0]} ausearch_rc=${st[1]} clean_rc=${st[2]} awk_rc=${st[3]}
+
+# ------------------------------------------------------------------------------
+# Judge the exit codes
+# ------------------------------------------------------------------------------
+[ "$clean_rc" -eq 0 ] || die "utf8-clean failed ($clean_rc)"
+[ "$awk_rc" -eq 0 ] || die "csv-repair failed ($awk_rc)"
+
+case "$ausearch_rc" in
+  0) ;;
+  1)
+    # "<no matches>" is the only exit-1 case that is not an error.
+    if ! grep -qx '<no matches>' "$err"; then
+      cat "$err" >&2
+      die "ausearch failed (exit 1)"
+    fi ;;
+  *)
+    cat "$err" >&2
+    die "ausearch failed (exit $ausearch_rc)" ;;
+esac
+
+# 141 = SIGPIPE: harmless only if ausearch stopped reading on its own.
+if [ "$zcat_rc" -ne 0 ] && [ "$zcat_rc" -ne 141 ]; then
+  die "zcat failed ($zcat_rc)"
+fi
+exit 0

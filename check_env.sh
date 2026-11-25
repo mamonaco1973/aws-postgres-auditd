@@ -17,6 +17,8 @@
 # - Any failure causes the script to exit with a non-zero status.
 # ==============================================================================
 
+set -euo pipefail
+
 echo "NOTE: Validating that required commands are found in your PATH."
 
 # ------------------------------------------------------------------------------
@@ -61,10 +63,9 @@ fi
 
 echo "NOTE: Checking AWS CLI connection."
 
-aws sts get-caller-identity --query "Account" --output text >> /dev/null
-
 # Abort execution if AWS authentication fails.
-if [ $? -ne 0 ]; then
+if ! aws sts get-caller-identity --region us-east-2 \
+     --query "Account" --output text >> /dev/null; then
   echo "ERROR: Failed to connect to AWS."
   echo "ERROR: Check credentials and environment variables."
   exit 1

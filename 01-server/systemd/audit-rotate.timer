@@ -1,0 +1,13 @@
+# ==============================================================================
+# audit-rotate.timer: daily, standing in for logrotate (which can't drive
+# auditd 4.1.2 correctly; see CLAUDE.md "Verified on 26.04").
+# ==============================================================================
+[Unit]
+Description=Rotate the audit log chain daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

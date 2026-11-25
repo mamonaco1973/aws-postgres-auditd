@@ -1,77 +1,128 @@
-# PostgreSQL on AWS: Amazon RDS and Aurora, side by side
+# Linux audit logs as PostgreSQL tables: file_fdw over auditd
 
-Both of AWS's managed PostgreSQL engines, built from one Terraform stack and
-loaded with the same data. **Amazon RDS for PostgreSQL** runs as a Multi-AZ
-primary with a read replica; **Aurora PostgreSQL** runs as a Serverless v2
-cluster with a writer and a reader. A **pgweb** host gives you a browser
-client for both, and both are loaded with the
-[Pagila](https://www.postgresql.org/ftp/projects/pgFoundry/dbsamples/pagila/) sample database, so you can
-compare them on the same queries.
+Can a database query the operating system's audit trail **in place**, with no
+pipeline that loads it first? This lab puts **auditd** and **PostgreSQL 18**
+on one Ubuntu 26.04 host and exposes `/var/log/audit` as tables through
+`file_fdw`: the active log, the rotated one and the compressed history, read
+on every query. Next to it runs the conventional answer, a 60-second ingest
+into an indexed table, and a benchmark suite that measures the two on the
+same data. A **pgweb** host gives you a browser client.
 
 ![pgweb](pgweb.png)
 
 | Piece | Where | Role |
 |---|---|---|
-| **RDS primary** | `rds-subnet-1`/`-2` | `postgres-rds-instance`, `db.t4g.micro`, 20 GB gp3, Multi-AZ, Performance Insights |
-| **Multi-AZ standby** | the other AZ | synchronous copy of the primary; no endpoint |
-| **RDS read replica** | `rds-subnet-1`/`-2` | `postgres-rds-replica`, asynchronous copy with its own endpoint |
-| **Aurora cluster** | `rds-subnet-1`/`-2` | `aurora-postgres-cluster`, Serverless v2 (0–4 ACU, pauses after 5 idle minutes), writer `aurora-postgres-instance-1`, reader `aurora-postgres-instance-2` |
-| **pgweb-deployment** | `rds-subnet-1` | Ubuntu 24.04, `t3.medium`; loads Pagila into both engines, then serves pgweb on port 80 |
-| **Secrets Manager** | regional | `postgres-credentials` and `aurora-postgres-credentials`: user, password, endpoint |
+| **auditd-server** | `auditd-subnet-1` | Ubuntu 26.04, `m7i.large`, 60 GB gp3; everything below runs here |
+| **auditd 4.1.2** | auditd-server | watches `/data` (`-w /data -p wa -k data_watch`) and writes `/var/log/audit` |
+| **PostgreSQL 18** | auditd-server | `localhost:5432`, database `auditdb`, schemas `audit_fdw` and `audit_native` |
+| **audit-fdw wrappers** | `/usr/local/lib/audit-fdw/` | what the foreign tables run: `zcat -f` over the chain, then `ausearch` |
+| **audit-ingest.timer** | auditd-server | every 60 s, `ausearch --checkpoint` → `COPY` into `audit_native.events` |
+| **audit-rotate** | `/usr/local/sbin/` | rotates and compresses the chain (daily, or on demand) |
+| **pgweb** | auditd-server | port 80, no saved connection; you sign in as `audit_reader` |
+| **Secrets Manager** | regional | `auditd-postgres-credentials`: the `postgres` and `audit_reader` passwords |
 
 ## Architecture
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="architecture-dark.svg">
-  <img alt="A browser reaches one pgweb host over HTTP, which connects to both PostgreSQL engines on port 5432. The Aurora PostgreSQL writer and reader both sit on one shared cluster volume, and the reader is the failover target. The RDS for PostgreSQL primary copies asynchronously to a read replica with its own endpoint and mirrors synchronously to a Multi-AZ standby that has no endpoint. The admin passwords are in Secrets Manager." src="architecture-light.svg">
+  <img alt="A browser reaches pgweb on port 80 and signs in as audit_reader. pgweb queries PostgreSQL on localhost. The audit_fdw schema's foreign tables run wrapper scripts on every query, which pipe the whole /var/log/audit chain, oldest file first, through zcat and ausearch. auditd appends kernel events for the watched /data directory to the chain. Separately, audit-ingest runs every 60 seconds, reads new events with an ausearch checkpoint and copies them into the indexed audit_native.events table. audit-rotate runs the ingest, compresses the previous file and signals auditd to start a new one. The database passwords are in Secrets Manager." src="architecture-light.svg">
 </picture>
 
 Regenerate with `python3 make_diagram.py`.
 
-- **`01-rds/`** is the whole stack: the VPC (`rds-vpc`, 10.0.0.0/24) with two
-  public subnets (`rds-subnet-1` in us-east-2a, `rds-subnet-2` in us-east-2b),
-  the security groups, both database engines, the credentials in Secrets
-  Manager, and the pgweb host.
-- **`01-rds/data/`** holds the Pagila load scripts (`pagila-db.sql`,
-  `pagila-schema.sql`, `pagila-data.sql`) and the sample queries.
+- **`01-server/`** is the whole stack: the VPC (`auditd-vpc`, 10.0.0.0/24)
+  with one public subnet, the security group, the IAM role for SSM, the
+  secret and the server.
+- **`01-server/audit/`, `fdw/`, `sql/`, `systemd/`** are what cloud-init
+  installs on the server.
+- **`01-server/bench/`** holds the event generator, the corpus synthesizer,
+  the benchmark queries and driver, and the results.
 
-## How the two engines differ
+## How it works
 
-| | RDS for PostgreSQL | Aurora PostgreSQL |
-|---|---|---|
-| Copies of the data | three: primary, standby, replica | one cluster volume, shared by every instance |
-| What you can read | the primary and the replica, each on its own endpoint | the writer on the cluster endpoint, the reader on the reader endpoint |
-| The standby | real and billed, but no endpoint and not readable | none: the reader is the failover target |
-| Compute | fixed instance class (`db.t4g.micro`) | Serverless v2, 0–4 ACU; pauses after 5 idle minutes |
+### Two FDW layers
 
-### When the writer fails
+| Object | What it is |
+|---|---|
+| `audit_fdw.log_files` | the chain itself: name, size, modified, compressed, oldest first |
+| `audit_fdw.raw_records` | every raw line, oldest file to newest (`zcat -f` passes plain files through and decompresses `.gz`) |
+| `audit_fdw.records` | those lines parsed with regular expressions: `record_type`, `event_time`, `serial`, `fields` (jsonb, quoted and hex-encoded values decoded) |
+| `audit_fdw.events` / `events_v` | one row per **event**: the chain piped into `ausearch --format csv`, typed in the view |
+| `audit_fdw.search_events(from, to, key)` | the same, but with the filter passed to ausearch (`-ts -te -k`) |
 
-| Action | Engine | What happens |
-|---|---|---|
-| **Failover** (`aws rds failover-db-cluster`) | Aurora | The reader and the writer trade places. The cluster endpoint follows the new writer. Nothing to copy, and it's reversible: fail over again to swap back. |
-| **Reboot with failover** (`aws rds reboot-db-instance --force-failover`) | RDS | The standby takes over. The endpoint name stays the same, and a new standby is built behind it. |
-| **Promote** (`aws rds promote-read-replica`) | RDS | The replica breaks off into its own database. Replication stops for good; there's no un-promote. |
+A single syscall is several records (SYSCALL, CWD, PATH ×n, PROCTITLE)
+sharing a serial number. The raw layer shows them as they are; correlating
+them, resolving UIDs and naming the action ("renamed", "opened-file") is
+what **ausearch** (through auparse) already does, so the event layer uses it
+as the parser instead of reimplementing it in SQL.
+
+`file_fdw` has no filter pushdown: every query runs the wrapper and reads the
+**whole** chain, then PostgreSQL filters. `search_events()` exists to measure
+what moving the filter into ausearch buys.
+
+### Things ausearch does that the wrappers work around
+
+Verified on ausearch 4.1.2 (details in [CLAUDE.md](CLAUDE.md)):
+
+- It reads stdin only when stdin is a pipe. Under PostgreSQL stdin is
+  `/dev/null`, and ausearch then silently searches the **system** logs. The
+  wrappers always pipe the chain in.
+- It exits 1 both for "no matches" and for real errors. The wrapper accepts
+  exit 1 only when stderr says exactly `<no matches>`.
+- Its CSV is not RFC 4180: nothing is quoted, so a comma in a file name adds
+  a column and a `"` breaks PostgreSQL's CSV parser. The foreign tables use a
+  quote byte that never occurs, and `csv-repair.awk` re-splits rows with
+  extra commas. Non-UTF-8 bytes in relative paths come out raw;
+  `utf8-clean` escapes them.
+- DATE and TIME are local time, but the `GMT_OFFSET` column makes the
+  timestamp exact; it matches the raw records' epoch to the millisecond.
+
+### Rotation
+
+auditd never compresses its logs, and on 4.1.2 `SIGUSR1` always performs
+auditd's own rename-and-shift, so the usual logrotate recipe (rename, then
+signal) scrambles the file order. Instead auditd's size-based rotation is off
+(`max_log_file_action = ignore`) and `audit-rotate`:
+
+1. runs the native ingest, so nothing in `audit.log.1` is compressed before
+   it has been loaded;
+2. takes an **exclusive** lock that the FDW wrappers and the ingest hold
+   **shared** while they read, so no query ever sees a half-shifted chain;
+3. shifts `.N.gz` → `.N+1.gz` and compresses `.1` → `.2.gz`;
+4. sends `SIGUSR1`, and auditd renames `audit.log` → `.1` and opens a new
+   file.
+
+The result is always `audit.log`, an uncompressed `audit.log.1`, and
+compressed history, which is what `log_files` shows.
 
 ## How it boots
 
-1. Terraform builds the network, both engines and the secrets, generating a
-   24-character password for each engine's `postgres` user.
-2. The pgweb host installs the PostgreSQL client, clones this repository, and
-   loads Pagila into both engines' writer endpoints with `psql`. Progress is
-   in `/root/db_load.log`.
-3. It installs pgweb 0.17.0 as a systemd service on port 80. pgweb starts
-   without a connection; you pick the engine when you connect.
+1. Terraform builds the network, the role, the secret (two 24-character
+   passwords) and the server.
+2. cloud-init clones this repository and runs
+   `01-server/scripts/setup_server.sh`: installs auditd, PostgreSQL 18 and
+   sysstat; creates the `auditread` group (auditd's `log_group`, with
+   `postgres` as a member, so PostgreSQL can read the logs but never write
+   them); installs the rules, the wrappers and `audit-rotate`. Progress is
+   in `/root/userdata.log`.
+3. It builds `auditdb`: roles, both schemas and the ingest table
+   (`/root/db_setup.log`), and starts `audit-ingest.timer`.
+4. It installs pgweb 0.17.0 on port 80 (`/root/pgweb.log`).
+5. It seeds the demo: as `alice` and `bob`, it creates, appends to,
+   overwrites, chmods, chowns, renames and deletes files under `/data`, with
+   one denied write per round, rotating in between. You start with an active
+   log, a `.1` and several `.gz` files.
+6. It writes `/root/bootstrap.done`, which `validate.sh` waits for.
 
 ## Security groups
 
 ```
-internet ─80───▶ pgweb-deployment
-internet ─5432─▶ RDS primary, read replica, Aurora writer and reader
+internet ─80─▶ auditd-server (pgweb)
 ```
 
-Both groups (`http-sg` and `rds-sg`) allow `0.0.0.0/0`. Every database is
-publicly accessible, so you can also connect a local client such as pgAdmin
-or `psql` to any endpoint with the `postgres` password.
+`auditd-http-sg` allows TCP/80 only. There is no 5432 rule: PostgreSQL
+listens on localhost and is reached through pgweb on the same host. There is
+no SSH either; use SSM Session Manager.
 
 ## Prerequisites
 
@@ -86,13 +137,14 @@ this video: [AWS + Terraform: Easy Setup](https://youtu.be/BCMQo0CB9wk).
 ## Deploy
 
 ```bash
-git clone https://github.com/mamonaco1973/aws-postgres.git
-cd aws-postgres
-./apply.sh       # one phase: VPC, RDS, Aurora, secrets, pgweb host
+git clone https://github.com/mamonaco1973/aws-postgres-auditd.git
+cd aws-postgres-auditd
+./apply.sh       # one phase: VPC, secret, auditd-server
 ```
 
 Everything deploys to `us-east-2`. `apply.sh` ends by running `validate.sh`,
-which prints the pgweb URL and both writer endpoints:
+which waits for the server to finish bootstrapping (about 5 minutes) and
+prints:
 
 ```
 ==========================================================================
@@ -102,80 +154,199 @@ which prints the pgweb URL and both writer endpoints:
  PGWEB Application:
    http://ec2-203-0-113-10.us-east-2.compute.amazonaws.com
 
- RDS Instance:
-   postgres-rds-instance.abc123xyz.us-east-2.rds.amazonaws.com
+ Connect with:
+   Host localhost   Port 5432   Database auditdb
+   User audit_reader   SSL mode disable
 
- Aurora Instance:
-   aurora-postgres-cluster.cluster-abc123xyz.us-east-2.rds.amazonaws.com
+ Password:
+   aws secretsmanager get-secret-value --region us-east-2 \
+     --secret-id auditd-postgres-credentials --query SecretString --output text \
+     | jq -r .audit_reader_password
+
+ Shell on the server:
+   aws ssm start-session --region us-east-2 --target i-0123456789abcdef0
 
 ==========================================================================
 ```
 
 ## Try it
 
-1. Get an engine's password:
+Open the pgweb URL and connect with host `localhost`, port `5432`, user
+`audit_reader`, the password from the command above, database `auditdb` and
+SSL mode `disable`. The queries are in
+[`01-server/sql/queries.sql`](01-server/sql/queries.sql).
+
+1. **The files.** Nothing has been loaded anywhere; this is the directory.
+
+   ```sql
+   SELECT * FROM audit_fdw.log_files;
+   ```
+
+2. **Raw records of one rename**: about five records sharing one serial
+   (SYSCALL, CWD, PATH for each directory and name, PROCTITLE).
+
+   ```sql
+   SELECT record_type, event_time, serial, raw_line
+   FROM audit_fdw.records
+   WHERE serial = (SELECT serial FROM audit_fdw.records
+                   WHERE record_type = 'SYSCALL'
+                     AND fields->>'SYSCALL' = 'renameat2'
+                     AND fields->>'key' = 'data_watch'
+                   ORDER BY event_time DESC LIMIT 1)
+   ORDER BY record_type;
+   ```
+
+3. **Correlating by hand**: group the records of each event.
+
+   ```sql
+   SELECT serial, min(event_time) AS event_time,
+          jsonb_agg(jsonb_build_object('type', record_type) || fields
+                    ORDER BY record_type) AS records
+   FROM audit_fdw.records
+   WHERE serial IN (SELECT serial FROM audit_fdw.records
+                    WHERE fields->>'key' = 'data_watch')
+   GROUP BY serial ORDER BY serial DESC LIMIT 5;
+   ```
+
+4. **The same events, one readable row each**, through ausearch:
+
+   ```sql
+   SELECT event_time, serial, subj_prime AS who, action, result,
+          obj_prime AS object, obj2
+   FROM audit_fdw.events_v
+   WHERE key = 'data_watch'
+   ORDER BY event_time DESC LIMIT 20;
+   ```
+
+5. **No ETL.** Open a shell (`aws ssm start-session ...` from
+   `validate.sh`), make more events, and run step 4 again. The new rows are
+   there at once.
 
    ```bash
-   aws secretsmanager get-secret-value --secret-id postgres-credentials \
-     --query SecretString --output text | jq -r .password
+   sudo bash /opt/aws-postgres-auditd/01-server/bench/generate_events.sh --rounds 2
    ```
 
-   Use `aurora-postgres-credentials` for Aurora. The user is `postgres` for
-   both.
-
-2. Open the pgweb URL and connect with the engine's endpoint from
-   `validate.sh`, user `postgres`, that password, database `pagila`, and SSL
-   mode `require`. Disconnect and connect again to switch engines.
-3. Run the same queries on both engines (`01-rds/data/`):
+6. **Filter, sort, aggregate** like any table:
 
    ```sql
-   SELECT
-       f.title AS film_title,
-       a.first_name || ' ' || a.last_name AS actor_name
-   FROM film f
-   JOIN film_actor fa ON f.film_id = fa.film_id
-   JOIN actor a ON fa.actor_id = a.actor_id
-   ORDER BY f.title, actor_name
-   LIMIT 20;
+   SELECT subj_prime AS who, action, count(*)
+   FROM audit_fdw.events_v WHERE key = 'data_watch'
+   GROUP BY 1, 2 ORDER BY 1, 3 DESC;
+
+   SELECT event_time, subj_prime AS who, action, obj_prime AS object
+   FROM audit_fdw.events_v
+   WHERE key = 'data_watch' AND result = 'failed'
+   ORDER BY event_time DESC;
    ```
+
+   `queries.sql` also has most-touched files and activity per hour.
+
+7. **Rotate**, then run steps 1 and 6 again. The chain has shifted by one
+   (`.1` is now `.2.gz`) and the counts are unchanged: older events are read
+   from the compressed files.
+
+   ```bash
+   sudo audit-rotate
+   ```
+
+8. **The conventional copy** answers the same question from an indexed
+   table, but runs up to 60 seconds behind:
 
    ```sql
-   SELECT
-       f.title,
-       STRING_AGG(a.first_name || ' ' || a.last_name, ', ') AS actor_names
-   FROM film f
-   JOIN film_actor fa ON f.film_id = fa.film_id
-   JOIN actor a ON fa.actor_id = a.actor_id
-   GROUP BY f.title
-   ORDER BY f.title
-   LIMIT 10;
+   SELECT subj_prime AS who, action, count(*)
+   FROM audit_native.events WHERE key = 'data_watch'
+   GROUP BY 1, 2 ORDER BY 1, 3 DESC;
+
+   SELECT * FROM audit_native.ingest_lag;
+   SELECT * FROM audit_native.ingest_log ORDER BY run_id DESC LIMIT 10;
    ```
 
-4. Optionally, connect pgAdmin from your own machine the same way:
+9. **One selective question, three ways.** Compare the plans: on `events_v`
+   the Foreign Scan reads everything and "Rows Removed by Filter" does the
+   work.
 
-   ![pgAdmin](pgadmin.png)
+   ```sql
+   EXPLAIN ANALYZE SELECT * FROM audit_fdw.events_v
+   WHERE key = 'data_watch' AND event_time >= now() - interval '1 hour';
 
-5. Try a failover from the table above, then reconnect.
+   EXPLAIN ANALYZE SELECT * FROM audit_fdw.search_events(
+     now() - interval '1 hour', now(), 'data_watch');
+
+   EXPLAIN ANALYZE SELECT * FROM audit_native.events
+   WHERE key = 'data_watch' AND event_time >= now() - interval '1 hour';
+   ```
+
+## Findings
+
+FINDINGS_PLACEHOLDER
+
+## When to use which
+
+WHEN_PLACEHOLDER
+
+## Limits
+
+- **Managed PostgreSQL can't do this.** RDS, Aurora, Cloud SQL, Azure
+  Database for PostgreSQL Flexible Server and OCI Database with PostgreSQL
+  give you no access to the host's files and no `COPY ... PROGRAM` /
+  `file_fdw program`. RDS's `log_fdw` reads only PostgreSQL's own logs.
+- **Containers** need a read-only bind mount of `/var/log/audit`, ausearch
+  inside the image, and the audit log group's GID mapped to the container's
+  postgres user. On Kubernetes that means a `hostPath` volume, which ties
+  the pod to one node.
+- **Security.** The postgres OS user can read the whole audit trail, so
+  SELECT on these tables is audit-log access, and SQL injection in any
+  application on this database becomes audit-log disclosure. The wrappers
+  are root-owned and validate every argument, `search_events` accepts only
+  a key matching `^[A-Za-z0-9_-]{1,64}$` and timestamps it formats itself,
+  and `audit_reader` has no `pg_read_server_files` or
+  `pg_execute_server_program`. pgweb on port 80 is plain HTTP; this is a
+  lab.
+- **Development and maintenance.** ausearch's CSV columns and normalizer
+  vocabulary can change between audit-userspace releases. The wrapper checks
+  the header and fails loudly if it changes; the event names (`renamed`,
+  `opened-file`) would change silently. Known parsing limits: a file name
+  containing `,<digits>,` is split in the wrong place, and a rename whose
+  target is given as a bare directory is resolved against the process's
+  working directory.
+
+## Prior art
+
+- **`file_fdw` + ausearch**: this lab.
+- **[Multicorn2](https://github.com/ShaheedHaque/multicorn2)**: Python FDWs,
+  which could push `WHERE` clauses into the reader. Evaluated, not built: it
+  is a compiled extension that runs Python inside the database server, and
+  it isn't in the Ubuntu archive. Its README says v3.1 supports
+  PostgreSQL 18 (latest v3.2); the original `pgsql-io/multicorn2`
+  repository was no longer reachable in November 2026, only mirrors.
+- **[laurel](https://github.com/threathunters-io/laurel)**: an auditd plugin
+  that rewrites events as enriched JSON lines, a better input for log
+  pipelines than ausearch CSV.
+- **[osquery](https://osquery.io/)**: the closest relative of "the OS as
+  virtual SQL tables", including tables fed from the Linux audit subsystem
+  (`process_events`, `socket_events`). It runs its own agent and SQLite
+  engine rather than PostgreSQL.
+- **[pgaudit](https://github.com/pgaudit/pgaudit)**: a different thing:
+  auditing of PostgreSQL's own sessions and statements.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| pgweb doesn't load | The host is still loading Pagila. `aws ssm start-session --target <instance-id>`, then `sudo tail /root/db_load.log` and `systemctl status pgweb`. |
-| `pagila` is missing | Check `/root/db_load.log` for the `psql` output. |
-| The first Aurora connection after a quiet spell is slow | The Aurora instances pause after 5 idle minutes at 0 ACU; the first connection resumes them. |
-| pgweb can't connect | Set SSL mode to `require`, and use the password from that engine's secret; the two engines have different passwords. |
+| pgweb doesn't load | The server is still bootstrapping. `aws ssm start-session --region us-east-2 --target <id>`, then `sudo tail /root/userdata.log`. |
+| `auditdb` or the schemas are missing | Check `/root/db_setup.log`. |
+| A query on `audit_fdw` fails with `audit-fdw: ...` | That's the wrapper's message (ausearch error, header change). More detail is in `/var/log/postgresql/`. |
+| `audit_native` is behind | `systemctl status audit-ingest.timer`; `SELECT * FROM audit_native.ingest_log ORDER BY run_id DESC`. |
+| `audit-rotate` refuses to run | Someone ran `service auditd rotate` by hand and left an uncompressed `.2`; compress or remove it. |
 
 ## Teardown
 
 ```bash
-./destroy.sh     # destroys the whole stack; no final snapshots, secrets deleted immediately
+./destroy.sh     # destroys the whole stack; the secret is deleted immediately
 ```
 
 ## Notes
 
-- **Lab only.** The databases and pgweb are open to the internet, pgweb runs
-  over plain HTTP with no sign-in of its own, and the admin passwords are in
-  the host's user data. The host's IAM role also has `AmazonSSMFullAccess`.
-  Put the databases in private subnets and restrict the security groups for
-  anything more.
+- **Lab only.** pgweb runs over plain HTTP with no sign-in of its own, and
+  the database passwords are in the host's user data. The `audit_reader`
+  password is the only thing between the internet and your audit trail.

@@ -1,0 +1,20 @@
+## ============================================================================
+## auditd FDW lab rules  ->  /etc/audit/rules.d/data.rules
+## ============================================================================
+## Loaded after Ubuntu's audit.rules (augenrules sorts by name), so the
+## backlog settings here override the stock 8192.
+
+## A fast generator (rotation_test.sh writes 10,000+ events in seconds) can
+## overflow the kernel queue. 65536 records costs a few MB of kernel memory.
+-b 65536
+
+## When the queue is full, block the writer for up to 60 s instead of
+## dropping records. Every bench run still records "lost" from auditctl -s.
+--backlog_wait_time 60000
+
+## No rate limit: lost events would be blamed on the FDW.
+-r 0
+
+## The one watch the lab is about: writes and attribute changes under /data.
+## A directory watch is recursive.
+-w /data -p wa -k data_watch

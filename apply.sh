@@ -2,16 +2,16 @@
 # ==============================================================================
 # FILE: apply.sh
 # ==============================================================================
-# ORCHESTRATION SCRIPT: RDS DEPLOYMENT AND VALIDATION
+# ORCHESTRATION SCRIPT: AUDITD FDW LAB DEPLOYMENT AND VALIDATION
 # ==============================================================================
-# Drives the end-to-end workflow for provisioning RDS infrastructure and
-# validating the resulting environment.
+# Builds the lab (one Ubuntu 26.04 host running auditd, PostgreSQL 18 and
+# pgweb) and waits until it has finished bootstrapping.
 #
 # High-level flow:
 #   1) Validate local environment prerequisites.
 #   2) Set the AWS default region for CLI and Terraform.
-#   3) Provision RDS infrastructure using Terraform.
-#   4) Run post-deployment validation and data load checks.
+#   3) Provision the VPC, secret and server with Terraform.
+#   4) Wait for cloud-init to finish and print the connection details.
 #
 # Notes:
 # - This script is written to fail fast if any prerequisite step fails.
@@ -30,10 +30,8 @@ set -euo pipefail
 # Verify that all required tools, credentials, and environment variables
 # are present before proceeding.
 # ==============================================================================
-./check_env.sh
-
 # Abort immediately if the environment validation fails.
-if [ $? -ne 0 ]; then
+if ! ./check_env.sh; then
   echo "ERROR: Environment check failed. Exiting."
   exit 1
 fi
@@ -43,18 +41,20 @@ fi
 # ==============================================================================
 # Export the AWS region used by Terraform and AWS CLI commands.
 # ==============================================================================
+# AWS_REGION is set too: the CLI gives it precedence over
+# AWS_DEFAULT_REGION, so an inherited AWS_REGION would otherwise win.
 export AWS_DEFAULT_REGION="us-east-2"
+export AWS_REGION="us-east-2"
 
 # ==============================================================================
-# STEP 2: TERRAFORM - BUILD DATABASE INFRASTRUCTURE
+# STEP 2: TERRAFORM - BUILD THE SERVER
 # ==============================================================================
-# Initialize and apply the Terraform configuration that provisions
-# RDS-related resources.
+# One phase: network, IAM role, secret and the auditd-server instance.
 # ==============================================================================
-echo "NOTE: Building Database Instances."
+echo "NOTE: Building the auditd lab server."
 
 # Change into the Terraform working directory.
-cd 01-rds
+cd 01-server
 
 # Initialize Terraform backend and providers.
 terraform init
@@ -68,6 +68,7 @@ cd ..
 # ==============================================================================
 # STEP 3: POST-DEPLOYMENT VALIDATION
 # ==============================================================================
-# Validate the deployed infrastructure and load any required sample data.
+# Wait for the bootstrap marker over SSM, then print the pgweb URL and how
+# to fetch the password.
 # ==============================================================================
 ./validate.sh

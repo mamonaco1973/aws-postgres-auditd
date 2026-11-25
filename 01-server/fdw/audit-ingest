@@ -1,0 +1,156 @@
+#!/bin/bash
+# ==============================================================================
+# FILE: audit-ingest   (run every 60 s by audit-ingest.timer, as root)
+# ==============================================================================
+# The conventional pipeline the FDW is compared against: ausearch with a
+# checkpoint emits only events it hasn't emitted before, psql COPYs them into
+# audit_native.events, and every run writes a row to audit_native.ingest_log.
+#
+# Duplicate safety, in layers:
+#   - the checkpoint is updated on a COPY of the file and committed only after
+#     the database transaction commits, so a failed load is simply retried;
+#   - audit_native.events has UNIQUE (serial, event_time) and the insert is
+#     ON CONFLICT DO NOTHING; skipped rows are counted in ingest_log, so a
+#     duplicate is visible rather than silently absorbed.
+#
+# Checkpoint exit codes (ausearch(8), verified on auditd 4.1.2):
+#   10 invalid checkpoint data      (seen when the checkpointed file was
+#                                    compressed out of --input-logs' reach)
+#   11 checkpoint processing error
+#   12 checkpoint event not found in matching log file
+# Recovery for all three: re-read the WHOLE chain (including .gz) from the
+# checkpoint's timestamp through stdin, then rebuild the checkpoint with
+# --start checkpoint. Overlap is removed by the unique constraint.
+#
+# Idempotent: re-running loads only what is new.
+# ==============================================================================
+
+set -euo pipefail
+. /usr/local/lib/audit-fdw/common.sh
+
+CP_DIR=/var/lib/audit-ingest
+CP="$CP_DIR/checkpoint"
+DB=auditdb
+
+install -d -m 0700 "$CP_DIR"
+work=$(mktemp -d)
+chmod 0755 "$work"
+trap 'rm -rf "$work"' EXIT
+
+t0=$(date +%s%3N)
+lock_shared "$LIVE_DIR"
+
+if [ -f "$CP" ]; then cp -p "$CP" "$work/cp"; fi
+
+# ------------------------------------------------------------------------------
+# run_checkpointed [extra ausearch args]: --input-logs with the working copy
+# of the checkpoint; output appended to $work/out. Prints the exit code.
+# ------------------------------------------------------------------------------
+run_checkpointed() {
+  local rc=0
+  LC_ALL=C TZ=UTC ausearch --input-logs --checkpoint "$work/cp" \
+    "${AUSEARCH_OPTS[@]}" "$@" >> "$work/out" 2> "$work/err" || rc=$?
+  echo "$rc"
+}
+
+# ------------------------------------------------------------------------------
+# no_matches: true if the last ausearch's exit 1 meant "<no matches>"
+# ------------------------------------------------------------------------------
+no_matches() {
+  grep -qx '<no matches>' "$work/err"
+}
+
+: > "$work/out"
+note=""
+rc=$(run_checkpointed)
+
+case "$rc" in
+  0) ;;
+  1)
+    no_matches || { cat "$work/err" >&2; die "ausearch failed (exit 1)"; } ;;
+  10|11|12)
+    case "$rc" in
+      10) why="invalid checkpoint data" ;;
+      11) why="checkpoint processing error" ;;
+      12) why="checkpoint event not found in log file" ;;
+    esac
+    note="exit $rc ($why): recovered by full-chain read from checkpoint time"
+    echo "audit-ingest: $note" >&2
+
+    # Checkpoint line: "output=<node> <sec>.<msec>:<serial> 0x<type>"
+    cp_sec=$(sed -n 's/^output=[^ ]* \([0-9]*\)\..*/\1/p' "$CP" 2>/dev/null || true)
+    [ -n "$cp_sec" ] || cp_sec=0
+    ts_args=()
+    if [ "$cp_sec" -gt 0 ]; then
+      # Two seconds of overlap: ausearch -ts has one-second resolution.
+      ts_args=(-ts $(date -u -d "@$((cp_sec - 2))" '+%m/%d/%y %H:%M:%S'))
+    fi
+    cd "$LIVE_DIR"
+    mapfile -t files < <(list_files "$LIVE_DIR")
+    rrc=0
+    zcat -f -- "${files[@]}" |
+      LC_ALL=C TZ=UTC ausearch "${AUSEARCH_OPTS[@]}" "${ts_args[@]}" \
+        >> "$work/out" 2> "$work/err" || rrc=$?
+    if [ "$rrc" -ne 0 ] && ! { [ "$rrc" -eq 1 ] && no_matches; }; then
+      cat "$work/err" >&2; die "recovery read failed (exit $rrc)"
+    fi
+
+    # Rebuild a usable checkpoint for the next run.
+    rm -f "$work/cp"
+    if [ -f "$CP" ]; then cp -p "$CP" "$work/cp"; fi
+    crc=$(run_checkpointed --start checkpoint)
+    if [ "$crc" -ne 0 ] && ! { [ "$crc" -eq 1 ] && no_matches; }; then
+      # Last resort: start a fresh checkpoint at the end of the live files.
+      rm -f "$work/cp"
+      crc=$(run_checkpointed)
+      [ "$crc" -eq 0 ] || { [ "$crc" -eq 1 ] && no_matches; } || \
+        { cat "$work/err" >&2; die "could not rebuild checkpoint ($crc)"; }
+      note="$note; checkpoint restarted"
+    fi ;;
+  *)
+    cat "$work/err" >&2
+    die "ausearch failed (exit $rc)" ;;
+esac
+
+# ------------------------------------------------------------------------------
+# Clean and repair the CSV (see utf8-clean, csv-repair.awk), then load it
+# in one transaction
+# ------------------------------------------------------------------------------
+"$AUDIT_FDW_LIB/utf8-clean" < "$work/out" |
+  awk -f "$AUDIT_FDW_LIB/csv-repair.awk" > "$work/load.csv"
+
+cat > "$work/load.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+BEGIN;
+TRUNCATE audit_native.events_stage;
+\copy audit_native.events_stage FROM pstdin WITH (format csv, quote E'\x01')
+WITH ins AS (
+  INSERT INTO audit_native.events
+  SELECT t.*
+  FROM audit_native.events_stage s,
+       LATERAL audit_fdw.to_event(ROW(s.*)::audit_fdw.events) t
+  ON CONFLICT DO NOTHING
+  RETURNING 1
+), n AS (
+  SELECT (SELECT count(*) FROM ins) AS loaded,
+         (SELECT count(*) FROM audit_native.events_stage) AS staged
+)
+INSERT INTO audit_native.ingest_log
+  (rows_loaded, rows_skipped_dup, duration_ms, max_event_time, exit_code, note)
+SELECT n.loaded, n.staged - n.loaded,
+       (extract(epoch FROM clock_timestamp()) * 1000)::bigint - :t0,
+       (SELECT max(event_time) FROM audit_native.events),
+       :rc, NULLIF(:'note', '')
+FROM n;
+COMMIT;
+SQL
+
+runuser -u postgres -- psql -X -q -d "$DB" -v t0="$t0" -v rc="$rc" \
+  -v note="$note" -f "$work/load.sql" < "$work/load.csv"
+
+# ------------------------------------------------------------------------------
+# Commit the checkpoint only now that the rows are in
+# ------------------------------------------------------------------------------
+if [ -f "$work/cp" ]; then
+  install -m 0600 "$work/cp" "$CP"
+fi

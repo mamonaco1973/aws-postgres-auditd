@@ -1,0 +1,15 @@
+# ==============================================================================
+# audit-ingest.timer: every 60 s. AccuracySec=1s keeps the period honest;
+# systemd's default 1-minute accuracy would let runs drift by up to a minute,
+# which would distort the freshness benchmark.
+# ==============================================================================
+[Unit]
+Description=Run audit-ingest every 60 seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

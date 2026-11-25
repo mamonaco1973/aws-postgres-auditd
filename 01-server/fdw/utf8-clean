@@ -1,0 +1,32 @@
+#!/usr/bin/python3 -B
+# ==============================================================================
+# FILE: utf8-clean   (filter: stdin -> stdout)
+# ==============================================================================
+# ausearch escapes non-UTF-8 bytes in absolute paths (\xff) but NOT when it
+# joins a process's CWD with a relative name (verified on 26.04: touching
+# "bad\xff.txt" from inside /data/weird yields a raw 0xff byte in OBJ_PRIME).
+# One such byte makes PostgreSQL reject the whole COPY. This filter rewrites
+# invalid bytes in the same \xNN form ausearch itself uses, so valid UTF-8
+# (é, emoji) passes untouched and nothing is dropped.
+# ==============================================================================
+
+import sys
+
+
+def main():
+    """Copy stdin to stdout line by line, escaping invalid UTF-8.
+
+    The fast path decodes nothing: a line that is already valid UTF-8 is
+    written back as the original bytes.
+    """
+    out = sys.stdout.buffer
+    for line in sys.stdin.buffer:
+        try:
+            line.decode("utf-8")
+        except UnicodeDecodeError:
+            line = line.decode("utf-8", "backslashreplace").encode("utf-8")
+        out.write(line)
+
+
+if __name__ == "__main__":
+    main()

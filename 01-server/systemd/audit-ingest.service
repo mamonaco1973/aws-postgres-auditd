@@ -1,0 +1,11 @@
+# ==============================================================================
+# audit-ingest.service: one conventional ingest run (see audit-ingest).
+# ==============================================================================
+[Unit]
+Description=Load new audit events into audit_native.events
+After=auditd.service postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/audit-fdw/audit-ingest
