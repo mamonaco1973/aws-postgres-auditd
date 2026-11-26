@@ -192,14 +192,23 @@ both and compare the results and the query time pgweb shows. The real table
 can be up to 60 seconds behind, so right after new activity its numbers may
 briefly trail the virtual table's.
 
-1. **How many changes were made under `/data`:**
+1. **How many changes were made under `/data`.**
+
+   Virtual table:
 
    ```sql
-   SELECT count(*) FROM audit_fdw.events    WHERE key = 'data_watch';
+   SELECT count(*) FROM audit_fdw.events WHERE key = 'data_watch';
+   ```
+
+   Real table:
+
+   ```sql
    SELECT count(*) FROM audit_native.events WHERE key = 'data_watch';
    ```
 
-2. **Who did what**, an aggregation:
+2. **Who did what**, an aggregation.
+
+   Virtual table:
 
    ```sql
    SELECT who, action, result, count(*)
@@ -207,7 +216,11 @@ briefly trail the virtual table's.
    WHERE key = 'data_watch'
    GROUP BY who, action, result
    ORDER BY who, count(*) DESC;
+   ```
 
+   Real table:
+
+   ```sql
    SELECT who, action, result, count(*)
    FROM audit_native.events
    WHERE key = 'data_watch'
@@ -215,15 +228,21 @@ briefly trail the virtual table's.
    ORDER BY who, count(*) DESC;
    ```
 
-3. **The ten most recent changes** (`new_value` is a rename target, or the
-   new mode/owner for chmod/chown):
+3. **The ten most recent changes.** `new_value` is a rename target, or the
+   new mode/owner for chmod/chown.
+
+   Virtual table:
 
    ```sql
    SELECT event_time, who, action, result, file, new_value
    FROM audit_fdw.events
    WHERE key = 'data_watch'
    ORDER BY event_time DESC LIMIT 10;
+   ```
 
+   Real table:
+
+   ```sql
    SELECT event_time, who, action, result, file, new_value
    FROM audit_native.events
    WHERE key = 'data_watch'
