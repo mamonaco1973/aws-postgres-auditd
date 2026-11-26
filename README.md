@@ -192,64 +192,47 @@ Open the pgweb URL and connect with host `localhost`, port `5432`, user
 SSL mode `disable`. The queries are in
 [`01-server/sql/queries.sql`](01-server/sql/queries.sql).
 
-1. **The files the virtual table reads.** Nothing has been loaded
-   anywhere; this is the directory.
+Each query below is written twice, identical except for the table. Run
+both and compare the results and the query time pgweb shows. The real table
+can be up to 60 seconds behind, so right after new activity its numbers may
+briefly trail the virtual table's.
+
+1. **How many changes were made under `/data`:**
 
    ```sql
-   SELECT * FROM audit_fdw.log_files;
+   SELECT count(*) FROM audit_fdw.events    WHERE key = 'data_watch';
+   SELECT count(*) FROM audit_native.events WHERE key = 'data_watch';
    ```
 
-2. **Who did what in `/data`**, straight from those files:
+2. **Who did what**, an aggregation:
+
+   ```sql
+   SELECT who, action, result, count(*)
+   FROM audit_fdw.events
+   WHERE key = 'data_watch'
+   GROUP BY who, action, result
+   ORDER BY who, count(*) DESC;
+
+   SELECT who, action, result, count(*)
+   FROM audit_native.events
+   WHERE key = 'data_watch'
+   GROUP BY who, action, result
+   ORDER BY who, count(*) DESC;
+   ```
+
+3. **The ten most recent changes** (`new_value` is a rename target, or the
+   new mode/owner for chmod/chown):
 
    ```sql
    SELECT event_time, who, action, result, file, new_value
    FROM audit_fdw.events
    WHERE key = 'data_watch'
-   ORDER BY event_time DESC LIMIT 20;
-   ```
+   ORDER BY event_time DESC LIMIT 10;
 
-3. **Freshness.** Open a shell (`aws ssm start-session ...` from
-   `validate.sh`) and make some events:
-
-   ```bash
-   sudo bash /opt/aws-postgres-auditd/01-server/bench/generate_events.sh --rounds 1
-   ```
-
-   Then query both tables right away, and again a minute later. The virtual
-   table has the new rows at once; the real one gets them at the next
-   ingest, within 60 seconds.
-
-   ```sql
-   SELECT 'virtual' AS side, count(*) AS events, max(event_time) AS newest
-   FROM audit_fdw.events
-   UNION ALL
-   SELECT 'real', count(*), max(event_time) FROM audit_native.events;
-
-   SELECT * FROM audit_native.ingest_lag;
-   SELECT * FROM audit_native.ingest_log ORDER BY run_id DESC LIMIT 5;
-   ```
-
-4. **Rotation.** Count both sides, run `sudo audit-rotate` on the server,
-   then run step 1 (`.1` is now `.2.gz`) and the count again. The counts
-   are unchanged.
-
-   ```sql
-   SELECT 'virtual' AS side, count(*) AS data_watch_events
-   FROM audit_fdw.events WHERE key = 'data_watch'
-   UNION ALL
-   SELECT 'real', count(*) FROM audit_native.events WHERE key = 'data_watch';
-   ```
-
-5. **The same selective query on both.** On the virtual table the Foreign
-   Scan reads every file and "Rows Removed by Filter" does the work; the
-   real table uses an index.
-
-   ```sql
-   EXPLAIN ANALYZE SELECT * FROM audit_fdw.events
-   WHERE key = 'data_watch' AND event_time >= now() - interval '1 hour';
-
-   EXPLAIN ANALYZE SELECT * FROM audit_native.events
-   WHERE key = 'data_watch' AND event_time >= now() - interval '1 hour';
+   SELECT event_time, who, action, result, file, new_value
+   FROM audit_native.events
+   WHERE key = 'data_watch'
+   ORDER BY event_time DESC LIMIT 10;
    ```
 
 ## Findings
