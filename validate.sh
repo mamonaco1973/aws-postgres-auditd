@@ -4,8 +4,7 @@
 # ==============================================================================
 # PURPOSE:
 #   Waits for the auditd lab server to finish bootstrapping, then prints the
-#   pgweb URL, the connection settings, and the command that fetches the
-#   audit_reader password.
+#   pgweb URL and the audit_reader connection settings, password included.
 #
 # WHAT THIS SCRIPT DOES:
 #   1) Looks up the running EC2 instance tagged Name=auditd-server.
@@ -20,7 +19,9 @@
 #
 # PREREQUISITES:
 #   - AWS CLI with ec2:DescribeInstances, ssm:SendCommand,
-#     ssm:GetCommandInvocation, ssm:DescribeInstanceInformation
+#     ssm:GetCommandInvocation, ssm:DescribeInstanceInformation,
+#     secretsmanager:GetSecretValue
+#   - jq
 # ==============================================================================
 
 set -euo pipefail
@@ -112,25 +113,42 @@ while true; do
 done
 
 # ------------------------------------------------------------------------------
+# READ THE PASSWORD
+# ------------------------------------------------------------------------------
+# Print the password outright rather than sending the user off to look it
+# up. Secrets Manager stays the source of truth; this just reads it back.
+# ------------------------------------------------------------------------------
+CREDS_JSON=$(aws secretsmanager get-secret-value --region "$AWS_REGION" \
+  --secret-id "$SECRET_ID" --query SecretString --output text \
+  2>/dev/null || true)
+if [ -n "$CREDS_JSON" ]; then
+  PASSWORD=$(jq -r .audit_reader_password <<<"$CREDS_JSON")
+else
+  # Usually the caller lacks secretsmanager:GetSecretValue. Fall back to
+  # showing the lookup command.
+  PASSWORD="<unavailable> - run: aws secretsmanager get-secret-value"
+  PASSWORD+=" --region ${AWS_REGION} --secret-id ${SECRET_ID}"
+  PASSWORD+=" --query SecretString --output text | jq -r .audit_reader_password"
+fi
+
+# ------------------------------------------------------------------------------
 # DISPLAY RESULTS
 # ------------------------------------------------------------------------------
+echo ""
 echo "=========================================================================="
-echo " PROJECT ENDPOINTS"
+echo " aws-postgres-auditd - Quick Start"
 echo "=========================================================================="
-echo
-echo " PGWEB Application:"
-echo "   http://${PUBLIC_DNS}"
-echo
-echo " Connect with:"
-echo "   Host localhost   Port 5432   Database auditdb"
-echo "   User audit_reader   SSL mode disable"
-echo
-echo " Password:"
-echo "   aws secretsmanager get-secret-value --region ${AWS_REGION} \\"
-echo "     --secret-id ${SECRET_ID} --query SecretString --output text \\"
-echo "     | jq -r .audit_reader_password"
-echo
-echo " Shell on the server:"
-echo "   aws ssm start-session --region ${AWS_REGION} --target ${INSTANCE_ID}"
-echo
-echo "=========================================================================="
+echo ""
+printf "%-24s %s\n" "NOTE: pgweb URL:"   "http://${PUBLIC_DNS}"
+printf "%-24s %s\n" "NOTE: Instance ID:" "${INSTANCE_ID}"
+echo ""
+printf "%-24s %s\n" "NOTE: Host:"        "localhost"
+printf "%-24s %s\n" "NOTE: Port:"        "5432"
+printf "%-24s %s\n" "NOTE: Database:"    "auditdb"
+printf "%-24s %s\n" "NOTE: Username:"    "audit_reader"
+printf "%-24s %s\n" "NOTE: Password:"    "${PASSWORD}"
+printf "%-24s %s\n" "NOTE: SSL mode:"    "disable"
+echo ""
+printf "%-24s %s\n" "NOTE: Server shell:" \
+  "aws ssm start-session --region ${AWS_REGION} --target ${INSTANCE_ID}"
+echo ""

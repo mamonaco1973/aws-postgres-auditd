@@ -164,31 +164,26 @@ prints:
 
 ```
 ==========================================================================
- PROJECT ENDPOINTS
+ aws-postgres-auditd - Quick Start
 ==========================================================================
 
- PGWEB Application:
-   http://ec2-203-0-113-10.us-east-2.compute.amazonaws.com
+NOTE: pgweb URL:         http://ec2-203-0-113-10.us-east-2.compute.amazonaws.com
+NOTE: Instance ID:       i-0123456789abcdef0
 
- Connect with:
-   Host localhost   Port 5432   Database auditdb
-   User audit_reader   SSL mode disable
+NOTE: Host:              localhost
+NOTE: Port:              5432
+NOTE: Database:          auditdb
+NOTE: Username:          audit_reader
+NOTE: Password:          <the audit_reader password from Secrets Manager>
+NOTE: SSL mode:          disable
 
- Password:
-   aws secretsmanager get-secret-value --region us-east-2 \
-     --secret-id auditd-postgres-credentials --query SecretString --output text \
-     | jq -r .audit_reader_password
-
- Shell on the server:
-   aws ssm start-session --region us-east-2 --target i-0123456789abcdef0
-
-==========================================================================
+NOTE: Server shell:      aws ssm start-session --region us-east-2 --target i-0123456789abcdef0
 ```
 
 ## Try it
 
 Open the pgweb URL and connect with host `localhost`, port `5432`, user
-`audit_reader`, the password from the command above, database `auditdb` and
+`audit_reader`, the password `validate.sh` printed, database `auditdb` and
 SSL mode `disable`. The queries are in
 [`01-server/sql/queries.sql`](01-server/sql/queries.sql).
 
