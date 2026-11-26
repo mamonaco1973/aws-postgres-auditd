@@ -21,15 +21,11 @@ import os
 import statistics
 import sys
 
-CONTENDERS = ["fdw_raw", "fdw_events", "fdw_search",
-              "native_noidx", "native_btree", "native_brin"]
+CONTENDERS = ["fdw", "native_btree", "native_noidx"]
 LABELS = {
-    "fdw_raw": "FDW raw (records)",
-    "fdw_events": "FDW ausearch (events_v)",
-    "fdw_search": "FDW + ausearch filter (search_events)",
-    "native_noidx": "native, no index",
-    "native_btree": "native, btree",
-    "native_brin": "native, BRIN time",
+    "fdw": "FDW (virtual)",
+    "native_btree": "Native, btree",
+    "native_noidx": "Native, no index",
 }
 QUERIES = {
     "q1": "Q1 full count",
@@ -170,15 +166,24 @@ def section_metadata(res):
     return out + [""]
 
 
-def section_corpus(res, corpus):
-    """Corpus, load time and storage per size."""
+def section_space(res, corpus):
+    """Storage and load cost per size: what each side keeps on disk.
+
+    Args:
+        res: results directory holding load.csv.
+        corpus: corpus root holding <size>/manifest.json.
+
+    Returns:
+        Markdown lines. The FDW keeps nothing but the log chain itself; the
+        native side keeps the chain AND its table and indexes.
+    """
     load = latest(read_csv(os.path.join(res, "load.csv")), ["size", "step"])
     by = {(r["size"], r["step"]): r for r in load}
-    out = ["| Size | Records | Events | Raw log bytes | Log chain on disk "
-           "(6 of 8 files .gz) | Native table | + btree indexes "
-           "| + BRIN-variant indexes | Load (COPY + insert + vacuum) "
-           "| btree build | BRIN-variant build |",
-           "|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| Size | Records | Events | Raw log bytes "
+           "| Log chain on disk (6 of 8 files .gz; all the FDW needs) "
+           "| Native table | + btree indexes | Native total "
+           "| Load (COPY + insert + vacuum) | btree build |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for s in SIZES:
         mpath = os.path.join(corpus, s, "manifest.json")
         if not os.path.exists(mpath) and (s, "table") not in by:
@@ -190,16 +195,15 @@ def section_corpus(res, corpus):
 
         load_ms = sum(float(g(st, "ms") or 0) for st in
                       ("copy_from_program", "typed_insert", "vacuum_analyze"))
+        tb, ib = g("table", "bytes"), g("indexes_btree", "bytes")
+        total = (float(tb) + float(ib)) if tb and ib else None
         out.append(
             f"| {s} | {m.get('records', '–'):,} | {m.get('events', '–'):,} "
             f"| {fmt_bytes(g('corpus_bytes_uncompressed', 'bytes'))} "
             f"| {fmt_bytes(m.get('bytes_on_disk'))} "
-            f"| {fmt_bytes(g('table', 'bytes'))} "
-            f"| {fmt_bytes(g('indexes_btree', 'bytes'))} "
-            f"| {fmt_bytes(g('indexes_brin', 'bytes'))} "
+            f"| {fmt_bytes(tb)} | {fmt_bytes(ib)} | {fmt_bytes(total)} "
             f"| {fmt_ms(load_ms)} "
-            f"| {fmt_ms(float(g('indexes_btree', 'ms') or 0))} "
-            f"| {fmt_ms(float(g('indexes_brin', 'ms') or 0))} |")
+            f"| {fmt_ms(float(g('indexes_btree', 'ms') or 0))} |")
     return out + [""]
 
 
@@ -229,23 +233,40 @@ def query_stats(res):
 
 
 def section_queries(st):
-    """Per size: median cold / warm latency for every query and contender."""
+    """Per size: FDW and native side by side, cold and warm medians.
+
+    Args:
+        st: output of query_stats().
+
+    Returns:
+        Markdown lines, one table per measured size. The last column is how
+        many times slower the FDW was than native with btree, warm.
+    """
     out = []
     for s in SIZES:
         if not any(k[0] == s for k in st):
             continue
-        out += [f"#### {s} records", "",
-                "Median of the runs, cold / warm. – = not applicable.", "",
-                "| Query | " + " | ".join(LABELS[c] for c in CONTENDERS) + " |",
-                "|---|" + "---|" * len(CONTENDERS)]
+        ns = sorted({v["n"] for k, v in st.items()
+                     if k[0] == s and k[3] in ("cold", "warm")})
+        runs = "/".join(str(n) for n in ns)
+        head = "| Query | "
+        rule = "|---|"
+        for c in CONTENDERS:
+            head += f"{LABELS[c]} cold | {LABELS[c]} warm | "
+            rule += "---|---|"
+        out += [f"### {s} records", "",
+                f"Median of {runs} runs per cell. Cold = page cache dropped "
+                "and PostgreSQL restarted first. – = not measured.", "",
+                head + "FDW ÷ btree (warm) |", rule + "---|"]
         for q, qname in QUERIES.items():
             cells = []
             for c in CONTENDERS:
-                cold = st.get((s, c, q, "cold"), {}).get("ms")
-                warm = st.get((s, c, q, "warm"), {}).get("ms")
-                cells.append("–" if cold is None and warm is None
-                             else f"{fmt_ms(cold)} / {fmt_ms(warm)}")
-            out.append(f"| {qname} | " + " | ".join(cells) + " |")
+                for mode in ("cold", "warm"):
+                    cells.append(fmt_ms(st.get((s, c, q, mode), {}).get("ms")))
+            fw = st.get((s, "fdw", q, "warm"), {}).get("ms")
+            nw = st.get((s, "native_btree", q, "warm"), {}).get("ms")
+            ratio = f"{fw / nw:,.0f}×" if fw and nw else "–"
+            out.append(f"| {qname} | " + " | ".join(cells) + f" | {ratio} |")
         out.append("")
     return out
 
@@ -272,13 +293,13 @@ def section_resources(st):
 
 
 def section_consistency(st):
-    """Do all event-level contenders return identical results?"""
-    out = ["| Size | Query | Event-level contenders agree? | Rows |",
+    """Do the FDW and both native variants return identical results?"""
+    out = ["| Size | Query | All contenders agree? | Rows |",
            "|---|---|---|---|"]
     for s in SIZES:
         for q in QUERIES:
             hashes, rows = set(), set()
-            for c in CONTENDERS[1:]:
+            for c in CONTENDERS:
                 for mode in ("cold", "warm"):
                     v = st.get((s, c, q, mode))
                     if v:
@@ -325,7 +346,7 @@ def section_freshness(res):
     n = [r["native_ms"] for r in rows]
     out = [f"{len(rows)} single events, polled every 0.2 s.", "",
            "| Path | Median | p95 | Max | Timeouts |", "|---|---|---|---|---|",
-           f"| FDW (`events_v`) | {fmt_ms(med(f))} | {fmt_ms(p95(f))} "
+           f"| FDW (`audit_fdw.events`) | {fmt_ms(med(f))} | {fmt_ms(p95(f))} "
            f"| {fmt_ms(max(float(x) for x in f if x) if any(f) else None)} "
            f"| {sum(1 for x in f if not x)} |",
            f"| Native (60 s timer) | {fmt_ms(med(n))} | {fmt_ms(p95(n))} "
@@ -370,38 +391,29 @@ def section_lost(res):
 
 
 def findings(st, fresh):
-    """Plain-English findings computed from the numbers."""
+    """Plain-English findings computed from the numbers.
+
+    Args:
+        st: output of query_stats().
+        fresh: (fdw_median_ms, native_median_ms) or None.
+
+    Returns:
+        Markdown bullet lines, one per measured size plus freshness.
+    """
     out = []
-    sizes = [s for s in SIZES if any(k[0] == s for k in st)]
-    if not sizes:
-        return out
-    s = sizes[-1]
+    for s in SIZES:
+        def g(c, q, mode="warm"):
+            return st.get((s, c, q, mode), {}).get("ms")
 
-    def g(c, q, mode="warm"):
-        return st.get((s, c, q, mode), {}).get("ms")
-
-    fe, nb, nn, fs = (g("fdw_events", "q2"), g("native_btree", "q2"),
-                      g("native_noidx", "q2"), g("fdw_search", "q2"))
-    if fe and nb:
-        out.append(f"- **Selective query (Q2) at {s}:** native with btree "
-                   f"answered in {fmt_ms(nb)} (warm) against "
-                   f"{fmt_ms(fe)} through `events_v`, about "
-                   f"{fe / nb:,.0f}× faster.")
-    if fe and fs:
-        out.append(f"- **Pushing the filter into ausearch** "
-                   f"(`search_events`) took Q2 from {fmt_ms(fe)} to "
-                   f"{fmt_ms(fs)} ({'faster' if fs < fe else 'not faster'}). "
-                   "ausearch still decompresses and reads every record; what "
-                   "it saves is formatting non-matching events and "
-                   "PostgreSQL parsing them.")
-    if nn and nb:
-        out.append(f"- **Indexes matter on native:** Q2 without indexes "
-                   f"{fmt_ms(nn)} vs btree {fmt_ms(nb)}.")
-    fr, fq = g("fdw_raw", "q1"), g("fdw_events", "q1")
-    if fr and fq:
-        out.append(f"- **Raw layer vs ausearch layer:** a full count costs "
-                   f"{fmt_ms(fr)} through the regex parser and "
-                   f"{fmt_ms(fq)} through ausearch at {s}.")
+        fe, nb, nn = g("fdw", "q2"), g("native_btree", "q2"), \
+            g("native_noidx", "q2")
+        if fe and nb:
+            line = (f"- **Selective query (Q2) at {s}:** native with btree "
+                    f"answered in {fmt_ms(nb)} (warm) against {fmt_ms(fe)} "
+                    f"through the FDW, about {fe / nb:,.0f}× faster.")
+            if nn:
+                line += f" Without indexes native took {fmt_ms(nn)}."
+            out.append(line)
     if fresh and fresh[0] is not None and fresh[1] is not None:
         out.append(f"- **Freshness:** a new event was visible through the FDW "
                    f"after a median {fmt_ms(fresh[0])}; the native table "
@@ -410,26 +422,26 @@ def findings(st, fresh):
 
 
 def report(res, corpus):
-    """Assemble SUMMARY.md."""
+    """Assemble SUMMARY.md: the side-by-side tables first, details last."""
     st = query_stats(res)
     fresh_lines, fresh = section_freshness(res)
-    out = ["# Benchmark summary: audit logs through file_fdw vs native tables",
+    out = ["# Benchmark summary: virtual table (file_fdw) vs real table",
            "",
            "Generated by `bench/summarize.py` from the CSVs in this directory.",
            "Every number below is measured; nothing is estimated.", "",
-           "## Environment", ""]
-    out += section_metadata(res)
-    out += ["## Findings (computed)", ""] + findings(st, fresh)
-    out += ["## Corpus, load and storage", ""] + section_corpus(res, corpus)
-    out += ["## Query latency", ""] + section_queries(st)
-    out += ["## Resources", ""] + section_resources(st)
-    out += ["## Result consistency", "",
-            "Each run's output is hashed. The raw layer answers in records, "
-            "not events, so it is excluded.", ""] + section_consistency(st)
-    out += ["## Concurrency", ""] + section_concurrency(res)
+           "## FDW vs native, per size", ""]
+    out += section_queries(st)
     out += ["## Freshness", ""] + fresh_lines
+    out += ["## Space and load", ""] + section_space(res, corpus)
+    out += ["## Concurrency", ""] + section_concurrency(res)
     out += ["## Rotation consistency", ""] + section_rotation(res)
-    out += ["## Lost events", ""] + section_lost(res)
+    out += ["## Details", "", "### Findings (computed)", ""]
+    out += findings(st, fresh)
+    out += ["### Resources", ""] + section_resources(st)
+    out += ["### Result consistency", "",
+            "Each run's output is hashed.", ""] + section_consistency(st)
+    out += ["### Lost events", ""] + section_lost(res)
+    out += ["### Environment", ""] + section_metadata(res)
     return "\n".join(out)
 
 

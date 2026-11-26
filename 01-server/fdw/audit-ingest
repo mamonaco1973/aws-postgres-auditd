@@ -2,7 +2,7 @@
 # ==============================================================================
 # FILE: audit-ingest   (run every 60 s by audit-ingest.timer, as root)
 # ==============================================================================
-# The conventional pipeline the FDW is compared against: ausearch with a
+# Feeds the real table the virtual one is compared against: ausearch with a
 # checkpoint emits only events it hasn't emitted before, psql COPYs them into
 # audit_native.events, and every run writes a row to audit_native.ingest_log.
 #
@@ -132,7 +132,7 @@ WITH ins AS (
   INSERT INTO audit_native.events
   SELECT t.*
   FROM audit_native.events_stage s,
-       LATERAL audit_fdw.to_event(ROW(s.*)::audit_fdw.events) t
+       LATERAL audit_fdw.to_event(ROW(s.*)::audit_fdw.events_csv) t
   ON CONFLICT DO NOTHING
   RETURNING 1
 ), n AS (

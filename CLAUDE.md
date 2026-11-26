@@ -2,12 +2,18 @@
 
 ## What This Project Does
 
-One Ubuntu 26.04 EC2 host where **PostgreSQL 18 reads the Linux audit logs
-as tables**, with no load step: `file_fdw` foreign tables run wrapper
-scripts that pipe `/var/log/audit` (active, rotated and `.gz` files) through
-`zcat -f` and, for the event layer, `ausearch`. A conventional pipeline (a
-60-second `ausearch --checkpoint` ingest into an indexed table) runs beside
-it, and `01-server/bench/` measures the two against each other.
+One Ubuntu 26.04 EC2 host that compares **two tables with the same
+columns** over the Linux audit logs:
+
+- `audit_fdw.events`, a **virtual** table rebuilt on every query: a typed view
+  over a `file_fdw` foreign table (`audit_fdw.events_csv`) whose wrapper pipes
+  `/var/log/audit` (active, rotated and `.gz` files) through `zcat -f` and
+  `ausearch --format csv`.
+- `audit_native.events`, a **real** table that a 60-second
+  `ausearch --checkpoint` ingest writes and indexes.
+
+`01-server/bench/` measures the two against each other. Raw audit records
+are out of scope.
 
 Single Terraform phase in `01-server/`. No modules, no workspaces, no Packer.
 
@@ -44,8 +50,8 @@ VPC auditd-vpc 10.0.0.0/24 (us-east-2)
         └── auditd-server  m7i.large, Ubuntu 26.04, 60 GB gp3, SSM only
               ├── auditd 4.1.2      -w /data -p wa -k data_watch, -b 65536
               ├── PostgreSQL 18.x   localhost:5432, db auditdb, TZ UTC
-              │     ├── audit_fdw     file_fdw over /var/log/audit
-              │     ├── audit_native  ingested copy, every 60 s
+              │     ├── audit_fdw     virtual table over /var/log/audit
+              │     ├── audit_native  real table, ingested every 60 s
               │     └── audit_bench   benchmark objects (postgres only)
               ├── pgweb 0.17.0      0.0.0.0:80, no saved connection
               └── /usr/local/lib/audit-fdw/  wrappers (root 0755)
@@ -64,8 +70,8 @@ VPC auditd-vpc 10.0.0.0/24 (us-east-2)
 | `01-server/scripts/install_server.sh` | cloud-init (templatefile): clone repo, run stage two |
 | `01-server/scripts/setup_server.sh` | stage two: packages, auditd, wrappers, PostgreSQL, pgweb, seed demo |
 | `01-server/audit/` | `data.rules`, `auditd_conf.sh`, `audit-rotate`, tmpfiles for the lock |
-| `01-server/fdw/` | `common.sh`, `raw-records`, `events`, `utf8-clean`, `csv-repair.awk`, `audit-ingest` |
-| `01-server/sql/01..05-*.sql` | roles/schemas, raw layer, ausearch layer, `search_events`, native |
+| `01-server/fdw/` | `common.sh`, `events`, `utf8-clean`, `csv-repair.awk`, `audit-ingest` |
+| `01-server/sql/01..04-*.sql` | roles/schemas, `log_files`, virtual table (`events_csv` → `events`), real table + ingest bookkeeping |
 | `01-server/sql/queries.sql` | the README "Try it" walkthrough |
 | `01-server/systemd/` | ingest + rotate services/timers, PostgreSQL cgroup accounting drop-in |
 | `01-server/bench/` | generator, corpus synthesizer, query files, `run_bench.sh`, `rotation_test.sh`, `summarize.py` |
@@ -80,8 +86,12 @@ VPC auditd-vpc 10.0.0.0/24 (us-east-2)
   the instance through user data (same as aws-postgres; lab only).
 - PostgreSQL roles: `postgres` (superuser; owns foreign tables and
   `SECURITY DEFINER` functions, because `program` needs
-  `pg_execute_server_program`); `audit_reader` (LOGIN, SELECT on `audit_fdw`
-  and `audit_native`, EXECUTE on `search_events`, `statement_timeout 5min`).
+  `pg_execute_server_program`); `audit_reader` (LOGIN, SELECT on
+  `audit_fdw.events`, `audit_fdw.log_files`, `audit_native.events`,
+  `ingest_log`, `ingest_lag`;
+  EXECUTE on `to_event` and `list_log_files`, which those views call;
+  `statement_timeout 5min`). Not on `events_csv`: the view reads it with
+  its owner's privileges.
 - OS: group `auditread` = auditd `log_group`; `postgres` is a member: read
   `/var/log/audit`, never write.
 
@@ -103,7 +113,7 @@ pgweb starts with no connection; enter it in the browser:
 | Where | What |
 |---|---|
 | `/root/userdata.log` | cloud-init stage one and two |
-| `/root/db_setup.log` | SQL 01–05 output |
+| `/root/db_setup.log` | SQL 01–04 output |
 | `/root/pgweb.log` | pgweb download and service status |
 | `/root/bootstrap.done` | marker validate.sh waits for |
 | `journalctl -u audit-ingest` | native ingest runs (also `audit_native.ingest_log`) |
@@ -129,8 +139,7 @@ Measured on Ubuntu 26.04.1, kernel 7.0.0-aws, auditd/audit-userspace
    `--checkpoint` **does not work on stdin** ("checkpointing stdin is not
    supported", no file written), so the native ingest uses `--input-logs`.
 3. **No pushdown.** `file_fdw` runs the program and reads all of it on every
-   scan; `EXPLAIN ANALYZE` shows "Rows Removed by Filter". `search_events`
-   puts `-ts/-te/-k` on the ausearch command line instead.
+   scan; `EXPLAIN ANALYZE` shows "Rows Removed by Filter".
 4. **CSV.** Header with `--extra-keys --extra-obj2 --extra-time` (25 columns):
    `NODE,EVENT,DATE,TIME,YEAR,MONTH,DAY,WEEKDAY,HOUR,MILLI,GMT_OFFSET,SERIAL_NUM,EVENT_KIND,SESSION,SUBJ_PRIME,SUBJ_SEC,SUBJ_KIND,ACTION,RESULT,OBJ_PRIME,OBJ_SEC,OBJ2,OBJ_KIND,HOW,KEY`.
    Not RFC 4180: **nothing is quoted**. A comma in a name adds a column (also
@@ -146,7 +155,7 @@ Measured on Ubuntu 26.04.1, kernel 7.0.0-aws, auditd/audit-userspace
    `--format csv`.
 5. **Time.** DATE/TIME follow `TZ` (America/Chicago printed `-06:00`), but
    GMT_OFFSET is printed, so `to_event()` builds an exact timestamptz. All
-   1,909 events in a test matched `audit_fdw.records` epochs to the
+   1,909 events in a test matched the raw records' epochs to the
    millisecond on (serial, time). Serial alone is not unique: auditd's own
    DAEMON_* events have a separate counter. `-ts` format under `LC_ALL=C` is
    `MM/DD/YY HH:MM:SS` (a 4-digit year is rejected).
@@ -176,7 +185,7 @@ Other things learned:
   `generate_events.sh` writes the user's UID to `/proc/self/loginuid` before
   `sudo -u` (allowed: `loginuid_immutable 0`), as a real login would.
 - `mv f /dir/` (directory target) renames via a directory fd and ausearch
-  resolves the target against the CWD (`obj2 = /var/snap/amazon-ssm-agent/...`)
+  resolves the target against the CWD (`new_value = /var/snap/amazon-ssm-agent/...`)
   and logs an extra failed rename; the generator passes full target paths.
 - 26.04 coreutils is the Rust implementation (`/usr/lib/cargo/bin/coreutils/*`,
   `gnumv`, `gnurm`), and sudo is sudo-rs; both work as expected.

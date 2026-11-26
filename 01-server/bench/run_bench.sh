@@ -2,13 +2,13 @@
 # ==============================================================================
 # FILE: run_bench.sh   (run as root on the lab server)
 # ==============================================================================
-# Objective comparison of reading audit logs through file_fdw against
-# conventional ingestion into indexed native tables, on identical data.
+# Two sides, identical data: a virtual table rebuilt from the log files on
+# every query (file_fdw), and a real table loaded once and indexed.
 #
 # Phases (pick with --phases, default all, in this order):
 #   corpus       build /bench/corpus/<size> with synth_corpus.py
-#   load         bench foreign tables + native table per size; load time and
-#                on-disk sizes; index build times
+#   load         bench foreign table + native table per size; load time,
+#                on-disk sizes, index build time
 #   queries      Q1-Q6, every contender, cold and warm (--runs each)
 #   concurrency  pgbench -c 1/4/8 -T 60 for Q2 and Q3
 #   freshness    20 single events: time until visible, FDW vs native
@@ -16,12 +16,10 @@
 #   summary      summarize.py -> results/SUMMARY.md
 #
 # Contenders, all on the same corpus:
-#   fdw_raw       audit_bench.records_<size>   (regex-parsed raw records)
-#   fdw_events    audit_bench.events_v_<size>  (ausearch, filtered in SQL)
-#   fdw_search    search_events_in()           (ausearch filters; Q2, Q6)
+#   fdw           audit_bench.events_<size>  (typed view over the corpus
+#                 foreign table audit_bench.events_csv_<size>)
 #   native_noidx  audit_bench.native_<size>, no indexes at all
-#   native_btree  + btree on event_time, key, serial
-#   native_brin   BRIN on event_time instead of btree, + btree key, serial
+#   native_btree  the same table + btree on event_time, key, serial
 #
 # Cold run: sync, drop the page cache, restart PostgreSQL, then run.
 # Warm run: one untimed run first, then the timed runs.
@@ -48,7 +46,6 @@ RUN_ID=$(date -u +%Y%m%dT%H%M%S)
 
 SIZES="100k 1m 10m"
 RUNS=5
-RAW_RUNS=""
 PGBENCH_SECS=60
 PHASES="corpus load queries concurrency freshness rotation summary"
 
@@ -56,14 +53,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --sizes) SIZES="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
-    --raw-runs) RAW_RUNS="$2"; shift 2 ;;
     --pgbench-secs) PGBENCH_SECS="$2"; shift 2 ;;
     --phases) PHASES="$2"; shift 2 ;;
-    *) echo "usage: $0 [--sizes S] [--runs N] [--raw-runs N]" \
-            "[--pgbench-secs N] [--phases P]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--sizes S] [--runs N] [--pgbench-secs N]" \
+            "[--phases P]" >&2; exit 2 ;;
   esac
 done
-RAW_RUNS="${RAW_RUNS:-$RUNS}"
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 mkdir -p "$RES" "$CORPUS_ROOT"
@@ -173,23 +168,30 @@ manifest() {
   echo "$RUN_ID,audit_userspace,$(dpkg-query -W -f '${Version}' auditd)"
   echo "$RUN_ID,shared_buffers,$(pg -At -c 'SHOW shared_buffers')"
   echo "$RUN_ID,runs,$RUNS"
-  echo "$RUN_ID,raw_runs,$RAW_RUNS"
   echo "$RUN_ID,pgbench_secs,$PGBENCH_SECS"
   echo "$RUN_ID,sizes,$SIZES"
 } > "$RES/metadata-$RUN_ID.csv"
-log "run $RUN_ID: phases [$PHASES] sizes [$SIZES] runs $RUNS raw-runs $RAW_RUNS"
+log "run $RUN_ID: phases [$PHASES] sizes [$SIZES] runs $RUNS"
 
 # ==============================================================================
 # Phase: corpus
 # ==============================================================================
 if has_phase corpus; then
-  # Templates: a fresh batch of real events, read back from the live chain.
+  # Templates: a fresh batch of real events, read back from the live chain
+  # as raw records (oldest file first, under the shared rotation lock, the
+  # same way the events wrapper reads it).
   log "capturing template events"
   since=$(date +%s)
   sleep 1
   bash "$HERE/generate_events.sh" --rounds 40 >/dev/null
   sleep 3
-  /usr/local/lib/audit-fdw/raw-records /var/log/audit |
+  (
+    . /usr/local/lib/audit-fdw/common.sh
+    lock_shared "$LIVE_DIR"
+    cd "$LIVE_DIR"
+    mapfile -t files < <(list_files "$LIVE_DIR")
+    zcat -f -- "${files[@]}"
+  ) |
     awk -v s="$since" 'match($0, /msg=audit\([0-9]+/) {
         t = substr($0, RSTART + 10, RLENGTH - 10) + 0
         if (t >= s) print }' > "$TEMPLATES"
@@ -208,9 +210,9 @@ fi
 # ==============================================================================
 # Phase: load
 # ==============================================================================
-# Per size: foreign tables and views pointing at the corpus, then the native
-# table loaded with the same ausearch CSV through COPY FROM PROGRAM, then the
-# index variants, each build timed and sized.
+# Per size: a foreign table and typed view pointing at the corpus, then the
+# native table loaded with the same ausearch CSV through COPY FROM PROGRAM,
+# then the btree indexes, build timed and sized.
 # ==============================================================================
 [ -f "$RES/load.csv" ] || echo "run_id,size,step,ms,rows,bytes" > "$RES/load.csv"
 
@@ -226,21 +228,16 @@ timed_sql() {
 }
 
 native_indexes() {
-  # native_indexes SIZE none|btree|brin
+  # native_indexes SIZE none|btree
   local s="$1" v="$2" t="audit_bench.native_$1"
   pg <<SQL
 DROP INDEX IF EXISTS audit_bench.native_${s}_time_btree,
-  audit_bench.native_${s}_time_brin, audit_bench.native_${s}_key,
-  audit_bench.native_${s}_serial;
+  audit_bench.native_${s}_key, audit_bench.native_${s}_serial;
 SQL
   case "$v" in
     none) ;;
     btree)
       pg -c "CREATE INDEX native_${s}_time_btree ON $t (event_time)"
-      pg -c "CREATE INDEX native_${s}_key ON $t (key)"
-      pg -c "CREATE INDEX native_${s}_serial ON $t (serial)" ;;
-    brin)
-      pg -c "CREATE INDEX native_${s}_time_brin ON $t USING brin (event_time)"
       pg -c "CREATE INDEX native_${s}_key ON $t (key)"
       pg -c "CREATE INDEX native_${s}_serial ON $t (serial)" ;;
   esac
@@ -252,19 +249,14 @@ if has_phase load; then
     dir="$CORPUS_ROOT/$size"
     log "load $size"
     pg -v s="$size" -v dir="$dir" <<'SQL'
-SELECT format('DROP FOREIGN TABLE IF EXISTS audit_bench.raw_%s, audit_bench.events_%s CASCADE', :'s', :'s') \gexec
+SELECT format('DROP FOREIGN TABLE IF EXISTS audit_bench.events_csv_%s CASCADE', :'s') \gexec
 SELECT format('DROP TABLE IF EXISTS audit_bench.native_%s, audit_bench.stage_%s', :'s', :'s') \gexec
-SELECT format($f$CREATE FOREIGN TABLE audit_bench.raw_%s (line text) SERVER audit_files
-  OPTIONS (program %L, format 'csv', delimiter E'\x1f', quote E'\x01')$f$,
-  :'s', '/usr/local/lib/audit-fdw/raw-records ' || :'dir') \gexec
-SELECT format($f$CREATE VIEW audit_bench.records_%s AS SELECT p.* FROM audit_bench.raw_%s r,
-  LATERAL audit_fdw.parse_record(r.line) p$f$, :'s', :'s') \gexec
-SELECT format($f$CREATE FOREIGN TABLE audit_bench.events_%s (LIKE audit_fdw.events) SERVER audit_files
+SELECT format($f$CREATE FOREIGN TABLE audit_bench.events_csv_%s (LIKE audit_fdw.events_csv) SERVER audit_files
   OPTIONS (program %L, format 'csv', quote E'\x01')$f$,
   :'s', '/usr/local/lib/audit-fdw/events ' || :'dir') \gexec
-SELECT format($f$CREATE VIEW audit_bench.events_v_%s AS SELECT t.* FROM audit_bench.events_%s e,
-  LATERAL audit_fdw.to_event(ROW(e.*)::audit_fdw.events) t$f$, :'s', :'s') \gexec
-SELECT format('CREATE UNLOGGED TABLE audit_bench.stage_%s (LIKE audit_fdw.events)', :'s') \gexec
+SELECT format($f$CREATE VIEW audit_bench.events_%s AS SELECT t.* FROM audit_bench.events_csv_%s e,
+  LATERAL audit_fdw.to_event(ROW(e.*)::audit_fdw.events_csv) t$f$, :'s', :'s') \gexec
+SELECT format('CREATE UNLOGGED TABLE audit_bench.stage_%s (LIKE audit_fdw.events_csv)', :'s') \gexec
 SELECT format('CREATE TABLE audit_bench.native_%s (LIKE audit_fdw.event_t)', :'s') \gexec
 SQL
     # Load = ausearch over the chain -> COPY -> typed INSERT, timed as one.
@@ -272,7 +264,7 @@ SQL
       '/usr/local/lib/audit-fdw/events $dir' WITH (format csv, quote E'\x01')")
     ms_ins=$(timed_sql "INSERT INTO audit_bench.native_$size SELECT t.*
       FROM audit_bench.stage_$size s,
-      LATERAL audit_fdw.to_event(ROW(s.*)::audit_fdw.events) t")
+      LATERAL audit_fdw.to_event(ROW(s.*)::audit_fdw.events_csv) t")
     pg -c "DROP TABLE audit_bench.stage_$size"
     ms_vac=$(timed_sql "VACUUM (ANALYZE) audit_bench.native_$size")
     rows=$(pg -At -c "SELECT count(*) FROM audit_bench.native_$size")
@@ -286,13 +278,11 @@ SQL
     raw_bytes=$(for f in "$dir"/audit.log*; do zcat -f "$f"; done | wc -c)
     load_row "$size" corpus_bytes_uncompressed "" "" "$raw_bytes"
 
-    for v in btree brin; do
-      t0=$(date +%s%3N)
-      native_indexes "$size" "$v"
-      t1=$(date +%s%3N)
-      ibytes=$(pg -At -c "SELECT pg_indexes_size('audit_bench.native_$size')")
-      load_row "$size" "indexes_$v" $((t1 - t0)) "" "$ibytes"
-    done
+    t0=$(date +%s%3N)
+    native_indexes "$size" btree
+    t1=$(date +%s%3N)
+    ibytes=$(pg -At -c "SELECT pg_indexes_size('audit_bench.native_$size')")
+    load_row "$size" indexes_btree $((t1 - t0)) "" "$ibytes"
     native_indexes "$size" none
     log "load $size: $rows events, copy ${ms_copy} ms, insert ${ms_ins} ms"
   done
@@ -304,21 +294,12 @@ fi
 QCSV="$RES/queries.csv"
 [ -f "$QCSV" ] || echo "run_id,size,contender,query,mode,run,ms,rows,result_md5,cpu_s,read_bytes,mem_peak_bytes,pidstat_cpu_s,pidstat_peak_rss_kb,pidstat_read_kb,wall_ms" > "$QCSV"
 
-# query_file CONTENDER Q -> path of the SQL file, or empty if not applicable
-query_file() {
-  local c="$1" q="$2"
-  case "$c" in
-    fdw_raw) echo "$Q/${q}_raw.sql" ;;
-    fdw_search)
-      case "$q" in q2|q6) echo "$Q/${q}_search.sql" ;; *) echo "" ;; esac ;;
-    *) echo "$Q/$q.sql" ;;
-  esac
-}
+# Both sides run the same SQL file; only the relation differs.
+query_file() { echo "$Q/$2.sql"; }
 
 relation_for() {
   case "$1" in
-    fdw_raw) echo "audit_bench.records_$2" ;;
-    fdw_events|fdw_search) echo "audit_bench.events_v_$2" ;;
+    fdw) echo "audit_bench.events_$2" ;;
     native_*) echo "audit_bench.native_$2" ;;
   esac
 }
@@ -337,7 +318,7 @@ run_one() {
   cg_mem_reset
   cpu0=$(cg_cpu_us); rb0=$(cg_read_bytes)
   pidstat -u -r -d -h 1 \
-    -C '^(postgres|ausearch|zcat|mawk|awk|utf8-clean|sh|flock|events|raw-records)$' \
+    -C '^(postgres|ausearch|zcat|mawk|awk|utf8-clean|sh|flock|events)$' \
     > "$ps" 2>&1 &
   local pspid=$!
   # ms = psql's \timing for the statement (client round trip, no connection
@@ -361,7 +342,7 @@ run_one() {
   echo "$RUN_ID,$size,$c,$q,$mode,$run,$ms,$rows,$md5,$(awk "BEGIN{printf \"%.2f\", ($cpu1-$cpu0)/1e6}"),$((rb1 - rb0)),$(cg_mem_peak),$ps_cpu,$ps_rss,$ps_rd,$(( (t1 - t0) / 1000000 ))" >> "$QCSV"
 }
 
-CONTENDERS="fdw_raw fdw_events fdw_search native_noidx native_btree native_brin"
+CONTENDERS="fdw native_noidx native_btree"
 QUERIES="q1 q2 q3 q4 q5 q6"
 
 if has_phase queries; then
@@ -372,12 +353,9 @@ if has_phase queries; then
       case "$c" in
         native_noidx) native_indexes "$size" none ;;
         native_btree) native_indexes "$size" btree ;;
-        native_brin)  native_indexes "$size" brin ;;
       esac
       n=$RUNS
-      [ "$c" = fdw_raw ] && n=$RAW_RUNS
       for q in $QUERIES; do
-        [ -n "$(query_file "$c" "$q")" ] || continue
         log "queries $size $c $q: $n cold + $n warm"
         for r in $(seq 1 "$n"); do
           cold_reset
@@ -390,12 +368,10 @@ if has_phase queries; then
       done
       # The no-pushdown evidence: Q2's plan, once per contender and size.
       f=$(query_file "$c" q2)
-      if [ "$c" != fdw_search ]; then
-        sed 's/^SELECT /EXPLAIN (ANALYZE, BUFFERS) SELECT /' "$f" > /tmp/explain.sql
-        pg -v rel="$(relation_for "$c" "$size")" \
-           -v a="$(manifest "$size" q2_from)" -v b="$(manifest "$size" q2_to)" \
-           -f /tmp/explain.sql > "$RES/explain-$size-$c-q2.txt" 2>&1 || true
-      fi
+      sed 's/^SELECT /EXPLAIN (ANALYZE, BUFFERS) SELECT /' "$f" > /tmp/explain.sql
+      pg -v rel="$(relation_for "$c" "$size")" \
+         -v a="$(manifest "$size" q2_from)" -v b="$(manifest "$size" q2_to)" \
+         -f /tmp/explain.sql > "$RES/explain-$size-$c-q2.txt" 2>&1 || true
     done
     native_indexes "$size" none
   done
@@ -413,15 +389,13 @@ if has_phase concurrency; then
   pause_ingest
   auditctl_snapshot concurrency before
   for size in $SIZES; do
-    for c in fdw_events fdw_search native_noidx native_btree native_brin; do
+    for c in $CONTENDERS; do
       case "$c" in
         native_noidx) native_indexes "$size" none ;;
         native_btree) native_indexes "$size" btree ;;
-        native_brin)  native_indexes "$size" brin ;;
       esac
       for q in q2 q3; do
         f=$(query_file "$c" "$q")
-        [ -n "$f" ] || continue
         # pgbench takes no psql variables: substitute them into a copy.
         script="/tmp/pgbench-$c-$q.sql"
         sed -e "s/:rel/$(relation_for "$c" "$size")/g" \
@@ -453,7 +427,7 @@ fi
 # ==============================================================================
 # Phase: freshness
 # ==============================================================================
-# One event at a time: how long until audit_fdw.events_v sees it, and how
+# One event at a time: how long until audit_fdw.events sees it, and how
 # long until audit_native.events does. The ingest timer must be running.
 # ==============================================================================
 FCSV="$RES/freshness.csv"
@@ -474,10 +448,10 @@ if has_phase freshness; then
     fdw_ms="" native_ms=""
     while [ -z "$fdw_ms" ] || [ -z "$native_ms" ]; do
       now=$(date +%s%3N)
-      if [ -z "$fdw_ms" ] && [ "$(pg -At -c "SELECT count(*) FROM audit_fdw.events_v WHERE obj_prime = '$p'")" -gt 0 ]; then
+      if [ -z "$fdw_ms" ] && [ "$(pg -At -c "SELECT count(*) FROM audit_fdw.events WHERE file = '$p'")" -gt 0 ]; then
         fdw_ms=$(( $(date +%s%3N) - t0 ))
       fi
-      if [ -z "$native_ms" ] && [ "$(pg -At -c "SELECT count(*) FROM audit_native.events WHERE obj_prime = '$p'")" -gt 0 ]; then
+      if [ -z "$native_ms" ] && [ "$(pg -At -c "SELECT count(*) FROM audit_native.events WHERE file = '$p'")" -gt 0 ]; then
         native_ms=$(( $(date +%s%3N) - t0 ))
       fi
       [ $(( now - t0 )) -lt 300000 ] || break

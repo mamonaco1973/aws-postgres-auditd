@@ -1,9 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# FILE: events DIR [-ts MM/DD/YY HH:MM:SS] [-te MM/DD/YY HH:MM:SS] [-k KEY]
+# FILE: events DIR
 # ==============================================================================
-# Backs audit_fdw.events and search_events(): pipes the whole chain into
-# ausearch's stdin and emits one CSV row per correlated event.
+# Backs audit_fdw.events_csv (and the benchmark corpora's foreign tables):
+# pipes the whole chain into ausearch's stdin and emits one CSV row per
+# correlated event. It takes no filters: file_fdw can't push a WHERE clause
+# down, so every scan reads every file. That is the cost being measured.
 #
 # Why stdin and not --input-logs: --input-logs reads only uncompressed files,
 # and stdin lets one path cover active, rotated and .gz files alike, in the
@@ -21,28 +23,7 @@ set -euo pipefail
 . /usr/local/lib/audit-fdw/common.sh
 
 dir=$(check_dir "${1:-$LIVE_DIR}")
-shift || true
-
-# ------------------------------------------------------------------------------
-# Validate the filters strictly: they come from SQL (search_events) and go
-# onto ausearch's command line.
-# ------------------------------------------------------------------------------
-filters=()
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -ts|-te)
-      [ $# -ge 3 ] || die "$1 needs a date and a time"
-      [[ "$2" =~ ^[0-9]{2}/[0-9]{2}/[0-9]{2}$ ]] || die "bad date: $2"
-      [[ "$3" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || die "bad time: $3"
-      filters+=("$1" "$2" "$3"); shift 3 ;;
-    -k)
-      [ $# -ge 2 ] || die "-k needs a key"
-      [[ "$2" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "bad key: $2"
-      filters+=(-k "$2"); shift 2 ;;
-    *)
-      die "unknown argument: $1" ;;
-  esac
-done
+[ $# -le 1 ] || die "unexpected arguments: ${*:2}"
 
 lock_shared "$dir"
 cd "$dir"
@@ -61,7 +42,7 @@ if [ "${#files[@]}" -gt 0 ]; then
 else
   true
 fi |
-  LC_ALL=C TZ=UTC ausearch "${AUSEARCH_OPTS[@]}" "${filters[@]}" 2>"$err" |
+  LC_ALL=C TZ=UTC ausearch "${AUSEARCH_OPTS[@]}" 2>"$err" |
   "$AUDIT_FDW_LIB/utf8-clean" |
   awk -f "$AUDIT_FDW_LIB/csv-repair.awk"
 st=("${PIPESTATUS[@]}")

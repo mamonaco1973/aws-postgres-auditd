@@ -1,7 +1,7 @@
 -- Q5: top 10 files by event count.
-SELECT obj_prime, count(*) AS n
+SELECT file, count(*) AS n
 FROM :rel
 WHERE obj_kind = 'file'
-GROUP BY obj_prime
-ORDER BY n DESC, obj_prime
+GROUP BY file
+ORDER BY n DESC, file
 LIMIT 10;

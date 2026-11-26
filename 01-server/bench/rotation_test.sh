@@ -8,8 +8,8 @@
 #     one data_watch event each (a shell ": > file" is a single openat)
 #   - meanwhile audit-rotate runs every S seconds (it also triggers the
 #     native ingest first, as it does in normal operation)
-#   - meanwhile a loop COUNTs that directory's events through events_v,
-#     recording every observation
+#   - meanwhile a loop COUNTs that directory's events through
+#     audit_fdw.events, recording every observation
 #
 # A count above N is a duplicate; a count lower than an earlier one is a gap.
 # After the writer stops and the chain settles, the FDW count and the native
@@ -50,8 +50,8 @@ install -d -o root -g root -m 0755 /data/rot
 install -d -o alice -g alice -m 0755 "$DIR"
 OBS="$RES/rotation-obs-$ID.csv"
 echo "ts_ms,phase,fdw_count" > "$OBS"
-COUNT_SQL="SELECT count(*) FROM audit_fdw.events_v
-           WHERE key = 'data_watch' AND obj_prime LIKE '$DIR/%'"
+COUNT_SQL="SELECT count(*) FROM audit_fdw.events
+           WHERE key = 'data_watch' AND file LIKE '$DIR/%'"
 
 lost0=$(auditctl -s | awk '$1 == "lost" {print $2}')
 ingest0=$(pg -c "SELECT coalesce(max(run_id), 0) FROM audit_native.ingest_log")
@@ -102,9 +102,9 @@ systemctl start audit-ingest.service
 # ------------------------------------------------------------------------------
 final=$(tail -1 "$OBS" | cut -d, -f3)
 native=$(pg -c "SELECT count(*) FROM audit_native.events
-                WHERE key = 'data_watch' AND obj_prime LIKE '$DIR/%'")
-native_distinct=$(pg -c "SELECT count(DISTINCT obj_prime) FROM audit_native.events
-                WHERE key = 'data_watch' AND obj_prime LIKE '$DIR/%'")
+                WHERE key = 'data_watch' AND file LIKE '$DIR/%'")
+native_distinct=$(pg -c "SELECT count(DISTINCT file) FROM audit_native.events
+                WHERE key = 'data_watch' AND file LIKE '$DIR/%'")
 read -r ingest_runs dup_skipped ckpt_errors < <(pg -F ' ' -c "
   SELECT count(*), coalesce(sum(rows_skipped_dup), 0),
          count(*) FILTER (WHERE exit_code IN (10, 11, 12))

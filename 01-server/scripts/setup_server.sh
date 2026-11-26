@@ -30,7 +30,7 @@ PG_CONF_DIR="/etc/postgresql/$PG_VER/main/conf.d"
 # ==============================================================================
 # 1) Packages
 # ==============================================================================
-# The server is UTC so that DATE/TIME from ausearch, the raw epoch and
+# The server is UTC so that DATE/TIME from ausearch, the kernel's epoch and
 # PostgreSQL's timezone all agree without conversion.
 # ==============================================================================
 timedatectl set-timezone UTC
@@ -72,7 +72,7 @@ chgrp auditread /var/log/audit/audit.log.* 2>/dev/null || true
 # 3) audit-fdw wrappers
 # ==============================================================================
 install -d -o root -g root -m 0755 /usr/local/lib/audit-fdw
-for f in common.sh raw-records events audit-ingest utf8-clean; do
+for f in common.sh events audit-ingest utf8-clean; do
   install -o root -g root -m 0755 "$SRV/fdw/$f" /usr/local/lib/audit-fdw/
 done
 install -o root -g root -m 0644 "$SRV/fdw/csv-repair.awk" \
@@ -116,8 +116,7 @@ done
 # ------------------------------------------------------------------------------
 {
   echo "NOTE: $(date -u) building auditdb"
-  for f in 01-database-roles 02-fdw-raw 03-fdw-events 04-search-function \
-           05-native; do
+  for f in 01-database-roles 02-log-files 03-fdw-events 04-native; do
     echo "NOTE: $f.sql"
     # Run from /tmp: postgres can't read root's working directory.
     (cd /tmp && runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
