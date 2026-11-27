@@ -9,8 +9,9 @@ on one Ubuntu 26.04 host, with the same columns:
 | **Real** | `audit_native.events` | written by a **60-second ingest** and indexed |
 
 A benchmark suite measures the two on identical data: query latency, how
-fast a new event shows up, disk space, concurrent users and log rotation. A
-**pgweb** host gives you a browser client.
+fast a new event shows up, disk space and log rotation (it also has a
+concurrent-users phase, not yet in the findings). A **pgweb** host gives
+you a browser client.
 
 ![pgweb](pgweb.png)
 
@@ -40,7 +41,8 @@ Regenerate with `python3 make_diagram.py`.
 - **`01-server/audit/`, `fdw/`, `sql/`, `systemd/`** are what cloud-init
   installs on the server.
 - **`01-server/bench/`** holds the event generator, the corpus synthesizer,
-  the benchmark queries and driver, and the results.
+  the benchmark queries and driver; a run writes its results to
+  `bench/results/`.
 
 ## How it works
 
@@ -75,8 +77,10 @@ audit-ingest.timer (every 60 s)
 
 The checkpoint is committed only after the database transaction commits, and
 the unique constraint makes a repeated load harmless; skipped duplicates are
-counted. Every run writes a row to `audit_native.ingest_log`, and
-`audit_native.ingest_lag` shows how far behind the table is.
+counted. Every run writes a row to `audit_native.ingest_log`.
+`audit_native.ingest_lag` shows the age of the newest stored event; it also
+grows when nothing new happens, so check `ingest_log` to see whether the
+ingest itself is keeping up.
 
 The two tables share one row type, `audit_fdw.event_t`:
 
@@ -97,8 +101,9 @@ auditd's own rename-and-shift, so the usual logrotate recipe (rename, then
 signal) scrambles the file order. Instead auditd's size-based rotation is off
 (`max_log_file_action = ignore`) and `audit-rotate`:
 
-1. runs the native ingest, so nothing in `audit.log.1` is compressed before
-   it has been loaded;
+1. runs the native ingest first, so `audit.log.1` is normally loaded before
+   it is compressed (if that ingest fails, rotation goes ahead and the next
+   ingest recovers the events by reading the compressed chain);
 2. takes an **exclusive** lock that the FDW wrappers and the ingest hold
    **shared** while they read, so no query ever sees a half-shifted chain;
 3. shifts `.N.gz` → `.N+1.gz` and compresses `.1` → `.2.gz`;
@@ -251,20 +256,46 @@ briefly trail the virtual table's.
 
 ## Findings
 
-_Pending: the benchmark of this two-table version has not been run yet.
-Earlier results, which included contenders this version removed, are not
-carried over._
+Measured on this lab (`m7i.large`, PostgreSQL 18.6, auditd 4.1.2) with a
+synthetic 100,000-record log chain (50,300 events, 25 MB raw, 4.6 MB on disk
+as active + `.1` + six `.gz` files). Median of 5 warm runs. Both tables
+returned identical results.
+
+| Query | Virtual table | Real table |
+|---|---|---|
+| Full count | 557 ms | 2.3 ms |
+| Key + 1-hour window | 554 ms | 1.1 ms |
+| Group by user, action | 562 ms | 10.5 ms |
+| One event by serial | 557 ms | 0.7 ms |
+| Top-10 files | 562 ms | 7.2 ms |
+| Failed ops, 24 h | 558 ms | 2.0 ms |
+
+Cold runs (page cache dropped, PostgreSQL restarted) add about 100 ms to the
+virtual table and 60–100 ms to the real one.
+
+- **Every virtual-table query costs the same**, whatever it asks: about
+  0.55 s, because each one re-reads and re-parses the whole chain (no
+  pushdown). That cost grows with the logs: a full ausearch pass took 0.5 s
+  at 100K records and 4.8 s at 1M.
+- **The real table** answers in milliseconds, but it is a copy: 8.5 MB of
+  table and 2.5 MB of btree indexes for 4.6 MB of compressed logs, loaded
+  in 0.9 s.
+- **Freshness:** a new event was visible in the virtual table within
+  0.2–1.2 s; the real table waits for the next 60-second ingest.
+- **Rotation:** writing 10,000 events while rotating every 3 seconds and
+  counting continuously gave no duplicates, no gaps and no lost events;
+  both tables ended at exactly 10,000.
 
 ## When to use which
 
-| Need | Better choice | Why |
+| Need | Better choice | Why (measured above) |
 |---|---|---|
-| See an event the moment it happens | FDW | visible on the next query (spot checks: about a second) vs up to 60 s |
-| No extra storage, no pipeline to run | FDW | the logs are the table |
-| Occasional ad-hoc questions on recent logs | FDW | half a second per query is fine at 100K |
-| Repeated or selective queries | Native | milliseconds vs half a second (measured), and FDW cost grows with log size |
-| Many users querying at once | Native (expected) | every FDW query re-parses the whole chain on its own; not measured |
-| History beyond log rotation and retention | Native | the FDW sees only the files that still exist |
+| See an event the moment it happens | Virtual | visible in 0.2–1.2 s vs up to 60 s |
+| No extra storage, no pipeline to run | Virtual | the logs are the table |
+| Occasional ad-hoc questions on recent logs | Virtual | about half a second per query at 100K is fine |
+| Repeated or selective queries | Real | milliseconds vs half a second, and the virtual table's cost grows with log size |
+| Many users querying at once | Real (expected) | every virtual query re-parses the whole chain on its own; concurrency is not in the findings yet |
+| History beyond log rotation and retention | Real | the virtual table sees only the files that still exist |
 
 ## Limits
 
